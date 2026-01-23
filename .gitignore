@@ -1,6 +1,6 @@
 # Binaries
-gotrace
-gotrace-example
+/gotrace
+/gotrace-example
 *.exe
 
 # Trace files
