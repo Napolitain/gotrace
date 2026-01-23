@@ -13,43 +13,65 @@ import (
 	"strings"
 )
 
+const (
+	marker    = "// +gotrace:instrumented"
+	guardFile = "gotrace_guard.go"
+	tracePkg  = "github.com/napolitain/gotrace/trace"
+)
+
 var (
-	write      = flag.Bool("w", false, "write result to source file")
-	pkgPath    = flag.String("pkg", "github.com/napolitain/gotrace/trace", "trace package import path")
-	skipMain   = flag.Bool("skip-main", false, "skip main() function")
-	skipInit   = flag.Bool("skip-init", false, "skip init() functions")
-	pattern    = flag.String("pattern", "", "only instrument functions matching pattern")
-	removeFlag = flag.Bool("remove", false, "remove tracing instrumentation")
+	forceAdd    = flag.Bool("add", false, "force add instrumentation")
+	forceRemove = flag.Bool("remove", false, "force remove instrumentation")
+	dryRun      = flag.Bool("dry-run", false, "show what would change without modifying")
+	verbose     = flag.Bool("verbose", false, "print detailed info")
+	pattern     = flag.String("pattern", "", "only instrument functions matching pattern")
 )
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: gotrace [flags] <file.go|directory>\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, `gotrace - Function tracing for Go
+
+Usage: gotrace [flags] [path]
+
+Toggle instrumentation in your Go project. Run once to add tracing,
+run again to remove it. Instrumented code requires -tags debug to build.
+
+Arguments:
+  path    Directory or file (default: current directory)
+
+Flags:
+`)
 		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, `
+Examples:
+  gotrace              # Toggle in current directory
+  gotrace ./cmd/app    # Toggle in specific directory  
+  gotrace --dry-run .  # Preview changes
+  gotrace --remove .   # Force remove
+
+Running instrumented code:
+  go run -tags debug .
+  go build -tags debug -o myapp .
+`)
 	}
 	flag.Parse()
 
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(1)
+	target := "."
+	if flag.NArg() > 0 {
+		target = flag.Arg(0)
 	}
 
-	target := flag.Arg(0)
+	if *forceAdd && *forceRemove {
+		fatal(fmt.Errorf("cannot use --add and --remove together"))
+	}
+
 	info, err := os.Stat(target)
 	if err != nil {
 		fatal(err)
 	}
 
 	if info.IsDir() {
-		err = filepath.Walk(target, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || fi.IsDir() || !strings.HasSuffix(path, ".go") {
-				return err
-			}
-			if strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			return processFile(path)
-		})
+		err = processDirectory(target)
 	} else {
 		err = processFile(target)
 	}
@@ -59,33 +81,247 @@ func main() {
 	}
 }
 
-func processFile(filename string) error {
-	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
+func processDirectory(dir string) error {
+	// Collect packages (directories with .go files)
+	packages := make(map[string][]string)
+
+	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		// Skip hidden dirs (but not . or ..), vendor, testdata, cmd
+		base := filepath.Base(path)
+		if fi.IsDir() {
+			if base == "vendor" || base == "testdata" || base == "cmd" {
+				return filepath.SkipDir
+			}
+			// Skip hidden directories, but allow . as starting point
+			if strings.HasPrefix(base, ".") && base != "." && base != ".." {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		// Skip test files, guard files, and trace package source
+		if strings.HasSuffix(path, "_test.go") || base == guardFile {
+			return nil
+		}
+		// Skip files with build tags that exclude debug (the trace stub)
+		content, err := os.ReadFile(path)
+		if err == nil && bytes.Contains(content, []byte("//go:build !debug")) {
+			return nil
+		}
+		// Skip files with //go:build debug (already trace-enabled)
+		if err == nil && bytes.Contains(content, []byte("//go:build debug")) {
+			return nil
+		}
+		pkgDir := filepath.Dir(path)
+		packages[pkgDir] = append(packages[pkgDir], path)
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("parse %s: %w", filename, err)
+		return err
 	}
 
-	if *removeFlag {
-		removeInstrumentation(node)
-	} else {
-		instrument(node)
+	for pkgDir, files := range packages {
+		if err := processPackage(pkgDir, files); err != nil {
+			return err
+		}
 	}
-
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, node); err != nil {
-		return fmt.Errorf("format %s: %w", filename, err)
-	}
-
-	if *write {
-		return os.WriteFile(filename, buf.Bytes(), 0644)
-	}
-	fmt.Println(buf.String())
 	return nil
 }
 
-func instrument(node *ast.File) {
-	needsImport := false
+func processPackage(pkgDir string, files []string) error {
+	// Check if any file is instrumented
+	instrumented := false
+	for _, f := range files {
+		if isInstrumented(f) {
+			instrumented = true
+			break
+		}
+	}
+
+	// Determine action
+	shouldAdd := !instrumented
+	if *forceAdd {
+		shouldAdd = true
+	}
+	if *forceRemove {
+		shouldAdd = false
+	}
+
+	if shouldAdd {
+		return instrumentPackage(pkgDir, files)
+	}
+	return uninstrumentPackage(pkgDir, files)
+}
+
+func isInstrumented(filename string) bool {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(content, []byte(marker))
+}
+
+func instrumentPackage(pkgDir string, files []string) error {
+	if *verbose || *dryRun {
+		fmt.Printf("Instrumenting %s\n", pkgDir)
+	}
+
+	var pkgName string
+	for _, filename := range files {
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+
+		// Skip already instrumented
+		if bytes.Contains(content, []byte(marker)) {
+			continue
+		}
+
+		fset := token.NewFileSet()
+		node, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", filename, err)
+		}
+
+		pkgName = node.Name.Name
+
+		// Skip files with no functions
+		hasFunc := false
+		ast.Inspect(node, func(n ast.Node) bool {
+			if _, ok := n.(*ast.FuncDecl); ok {
+				hasFunc = true
+				return false
+			}
+			return true
+		})
+		if !hasFunc {
+			continue
+		}
+
+		// Instrument
+		modified := instrumentAST(node)
+		if !modified {
+			continue
+		}
+
+		// Format
+		var buf bytes.Buffer
+		if err := format.Node(&buf, fset, node); err != nil {
+			return fmt.Errorf("format %s: %w", filename, err)
+		}
+
+		// Add marker after package line
+		output := addMarker(buf.Bytes())
+
+		if *dryRun {
+			fmt.Printf("  Would modify: %s\n", filename)
+			continue
+		}
+
+		if err := os.WriteFile(filename, output, 0644); err != nil {
+			return err
+		}
+		if *verbose {
+			fmt.Printf("  Instrumented: %s\n", filename)
+		}
+	}
+
+	if pkgName == "" {
+		return nil
+	}
+
+	// Generate guard file
+	guardPath := filepath.Join(pkgDir, guardFile)
+	if *dryRun {
+		fmt.Printf("  Would create: %s\n", guardPath)
+		return nil
+	}
+
+	guard := generateGuard(pkgName)
+	if err := os.WriteFile(guardPath, []byte(guard), 0644); err != nil {
+		return err
+	}
+	if *verbose {
+		fmt.Printf("  Created guard: %s\n", guardPath)
+	}
+
+	fmt.Printf("✓ Instrumented %s (run with: go run -tags debug .)\n", pkgDir)
+	return nil
+}
+
+func uninstrumentPackage(pkgDir string, files []string) error {
+	if *verbose || *dryRun {
+		fmt.Printf("Removing instrumentation from %s\n", pkgDir)
+	}
+
+	for _, filename := range files {
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+
+		// Skip non-instrumented
+		if !bytes.Contains(content, []byte(marker)) {
+			continue
+		}
+
+		fset := token.NewFileSet()
+		node, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", filename, err)
+		}
+
+		// Remove instrumentation
+		removeInstrumentation(node)
+
+		// Format
+		var buf bytes.Buffer
+		if err := format.Node(&buf, fset, node); err != nil {
+			return fmt.Errorf("format %s: %w", filename, err)
+		}
+
+		// Remove marker
+		output := removeMarker(buf.Bytes())
+
+		if *dryRun {
+			fmt.Printf("  Would restore: %s\n", filename)
+			continue
+		}
+
+		if err := os.WriteFile(filename, output, 0644); err != nil {
+			return err
+		}
+		if *verbose {
+			fmt.Printf("  Restored: %s\n", filename)
+		}
+	}
+
+	// Remove guard file
+	guardPath := filepath.Join(pkgDir, guardFile)
+	if *dryRun {
+		if _, err := os.Stat(guardPath); err == nil {
+			fmt.Printf("  Would remove: %s\n", guardPath)
+		}
+		return nil
+	}
+
+	os.Remove(guardPath) // ignore error if doesn't exist
+	if *verbose {
+		fmt.Printf("  Removed guard: %s\n", guardPath)
+	}
+
+	fmt.Printf("✓ Removed instrumentation from %s\n", pkgDir)
+	return nil
+}
+
+func instrumentAST(node *ast.File) bool {
+	modified := false
 
 	ast.Inspect(node, func(n ast.Node) bool {
 		fn, ok := n.(*ast.FuncDecl)
@@ -94,12 +330,6 @@ func instrument(node *ast.File) {
 		}
 
 		name := funcName(fn)
-		if *skipMain && name == "main" {
-			return true
-		}
-		if *skipInit && name == "init" {
-			return true
-		}
 		if *pattern != "" && !strings.Contains(name, *pattern) {
 			return true
 		}
@@ -107,7 +337,7 @@ func instrument(node *ast.File) {
 			return true
 		}
 
-		// Build args list: function name + all parameter names
+		// Build trace call with args
 		args := []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: fmt.Sprintf("%q", name)}}
 		if fn.Type.Params != nil {
 			for _, field := range fn.Type.Params.List {
@@ -130,13 +360,30 @@ func instrument(node *ast.File) {
 		}
 
 		fn.Body.List = append([]ast.Stmt{deferStmt}, fn.Body.List...)
-		needsImport = true
+		modified = true
 		return true
 	})
 
-	if needsImport {
-		addImport(node, *pkgPath)
+	if modified {
+		addImport(node, tracePkg)
 	}
+
+	// Add PrintSummary to main if present
+	ast.Inspect(node, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "main" || fn.Recv != nil {
+			return true
+		}
+		summaryCall := &ast.ExprStmt{
+			X: &ast.CallExpr{
+				Fun: &ast.SelectorExpr{X: ast.NewIdent("trace"), Sel: ast.NewIdent("PrintSummary")},
+			},
+		}
+		fn.Body.List = append(fn.Body.List, summaryCall)
+		return false
+	})
+
+	return modified
 }
 
 func removeInstrumentation(node *ast.File) {
@@ -148,7 +395,7 @@ func removeInstrumentation(node *ast.File) {
 
 		var filtered []ast.Stmt
 		for _, stmt := range fn.Body.List {
-			if !isTraceDefer(stmt) {
+			if !isTraceDefer(stmt) && !isTraceSummary(stmt) {
 				filtered = append(filtered, stmt)
 			}
 		}
@@ -156,7 +403,7 @@ func removeInstrumentation(node *ast.File) {
 		return true
 	})
 
-	removeImport(node, *pkgPath)
+	removeImport(node, tracePkg)
 }
 
 func funcName(fn *ast.FuncDecl) string {
@@ -204,6 +451,23 @@ func isTraceDefer(stmt ast.Stmt) bool {
 	return ok && id.Name == "trace" && sel.Sel.Name == "Trace"
 }
 
+func isTraceSummary(stmt ast.Stmt) bool {
+	expr, ok := stmt.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := expr.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == "trace" && sel.Sel.Name == "PrintSummary"
+}
+
 func addImport(node *ast.File, path string) {
 	for _, imp := range node.Imports {
 		if imp.Path.Value == fmt.Sprintf("%q", path) {
@@ -230,20 +494,102 @@ func addImport(node *ast.File, path string) {
 
 func removeImport(node *ast.File, path string) {
 	quoted := fmt.Sprintf("%q", path)
-	for _, decl := range node.Decls {
+	for i, decl := range node.Decls {
 		gen, ok := decl.(*ast.GenDecl)
 		if !ok || gen.Tok != token.IMPORT {
 			continue
 		}
 		var kept []ast.Spec
 		for _, spec := range gen.Specs {
-			imp := spec.(*ast.ImportSpec)
-			if imp.Path.Value != quoted {
+			imp, ok := spec.(*ast.ImportSpec)
+			if !ok || imp.Path.Value != quoted {
 				kept = append(kept, spec)
 			}
 		}
 		gen.Specs = kept
+		if len(kept) == 0 {
+			node.Decls = append(node.Decls[:i], node.Decls[i+1:]...)
+		}
+		return
 	}
+}
+
+func addMarker(content []byte) []byte {
+	lines := bytes.Split(content, []byte("\n"))
+	var result [][]byte
+	for i, line := range lines {
+		result = append(result, line)
+		// Add marker after package line
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("package ")) {
+			result = append(result, []byte(marker))
+			result = append(result, lines[i+1:]...)
+			break
+		}
+	}
+	return bytes.Join(result, []byte("\n"))
+}
+
+func removeMarker(content []byte) []byte {
+	lines := bytes.Split(content, []byte("\n"))
+	var result [][]byte
+	for _, line := range lines {
+		if bytes.Equal(bytes.TrimSpace(line), []byte(marker)) {
+			continue
+		}
+		result = append(result, line)
+	}
+	return cleanupBlanks(bytes.Join(result, []byte("\n")))
+}
+
+func cleanupBlanks(content []byte) []byte {
+	// Clean consecutive blank lines and blank lines after opening braces or before closing braces
+	lines := bytes.Split(content, []byte("\n"))
+	var result [][]byte
+	prevBlank := false
+	for i, line := range lines {
+		isBlank := len(bytes.TrimSpace(line)) == 0
+		// Skip blank line after opening brace
+		if isBlank && i > 0 {
+			prevLine := bytes.TrimSpace(lines[i-1])
+			if bytes.HasSuffix(prevLine, []byte("{")) {
+				continue
+			}
+		}
+		// Skip blank line before closing brace
+		if isBlank && i+1 < len(lines) {
+			nextLine := bytes.TrimSpace(lines[i+1])
+			if bytes.HasPrefix(nextLine, []byte("}")) {
+				continue
+			}
+		}
+		// Skip consecutive blank lines
+		if isBlank && prevBlank {
+			continue
+		}
+		result = append(result, line)
+		prevBlank = isBlank
+	}
+	return bytes.Join(result, []byte("\n"))
+}
+
+func generateGuard(pkgName string) string {
+	return fmt.Sprintf(`//go:build !debug
+
+// Code generated by gotrace. DO NOT EDIT.
+// This file prevents building instrumented code without -tags debug.
+// Remove instrumentation with: gotrace --remove .
+
+package %s
+
+func init() {
+// This undefined identifier causes a compile error without -tags debug
+var _ = __GOTRACE_INSTRUMENTED_RUN_WITH_TAGS_DEBUG__
+}
+`, pkgName)
+}
+
+func processFile(filename string) error {
+	return processPackage(filepath.Dir(filename), []string{filename})
 }
 
 func fatal(err error) {
