@@ -39,25 +39,28 @@ That's it! Running `gotrace .` again toggles instrumentation off.
 
 ### Safety First
 
-When you instrument code, gotrace creates a guard file that **prevents compilation** without `-tags debug`:
+When you run instrumented code without `-tags debug`, gotrace detects it and exits with a helpful error:
 
 ```bash
 $ gotrace .
 ✓ Instrumented myproject (run with: go run -tags debug .)
 
-$ go build .
-# myproject
-./gotrace_guard.go:11:9: undefined: __GOTRACE_INSTRUMENTED_RUN_WITH_TAGS_DEBUG__
+$ go run .
+⚠️  ERROR: Running instrumented code without -tags debug
+   This code has gotrace instrumentation but is running in production mode.
+
+   To run with tracing:  go run -tags debug .
+   To remove tracing:    gotrace --remove .
 ```
 
-This ensures you'll never accidentally commit or deploy instrumented code.
+This ensures you'll never accidentally run instrumented code in production.
 
 ### Toggle Workflow
 
-| State | `gotrace .` | `go build .` | `go build -tags debug .` |
-|-------|-------------|--------------|--------------------------|
-| Clean | Instruments | ✅ Builds | ✅ Builds |
-| Instrumented | Removes | ❌ Error | ✅ Builds with tracing |
+| State | `gotrace .` | `go run .` | `go run -tags debug .` |
+|-------|-------------|------------|------------------------|
+| Clean | Instruments | ✅ Runs | ✅ Runs |
+| Instrumented | Removes | ❌ Error | ✅ Runs with tracing |
 
 ## Output Example
 
