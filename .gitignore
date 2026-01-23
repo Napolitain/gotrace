@@ -1,0 +1,25 @@
+# Binaries
+gotrace
+gotrace-example
+*.exe
+
+# Trace files
+*.pftrace
+*.json
+trace.json
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
