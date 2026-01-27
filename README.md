@@ -55,6 +55,10 @@ $ go run .
 
 This ensures you'll never accidentally run instrumented code in production.
 
+### Module Wiring
+
+When gotrace instruments a module, it also updates that module's `go.mod` to add a `require` and a local `replace` for `github.com/napolitain/gotrace` so examples run without manual `go get`. Removing instrumentation cleans those entries back out.
+
 ### Toggle Workflow
 
 | State | `gotrace .` | `go run .` | `go run -tags debug .` |
@@ -184,6 +188,21 @@ trace.Reset()
 | Production (`go build`) | **Zero** — stub functions are completely inlined away |
 | Debug (`go build -tags debug`) | ~100-500ns per traced call |
 
+## Testing
+
+Run standard tests:
+
+```bash
+go test ./...
+go test -tags debug ./...
+```
+
+Optional integration tests (requires submodule init):
+
+```bash
+git submodule update --init --recursive
+go test -tags integration ./test/...
+```
 ## Project Structure
 
 ```
@@ -198,3 +217,4 @@ gotrace/
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+

@@ -2,20 +2,26 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+
+	"golang.org/x/mod/modfile"
 )
 
 const (
-	marker   = "// +gotrace:instrumented"
-	tracePkg = "github.com/napolitain/gotrace/trace"
+	marker      = "// +gotrace:instrumented"
+	traceModule = "github.com/napolitain/gotrace"
+	tracePkg    = traceModule + "/trace"
 )
 
 var (
@@ -83,6 +89,7 @@ Running instrumented code:
 func processDirectory(dir string) error {
 	// Collect packages (directories with .go files)
 	packages := make(map[string][]string)
+	moduleRoots := make(map[string]struct{})
 
 	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
@@ -118,6 +125,13 @@ func processDirectory(dir string) error {
 		}
 		pkgDir := filepath.Dir(path)
 		packages[pkgDir] = append(packages[pkgDir], path)
+		moduleRoot, err := findModuleRoot(pkgDir)
+		if err != nil {
+			return err
+		}
+		if moduleRoot != "" {
+			moduleRoots[moduleRoot] = struct{}{}
+		}
 		return nil
 	})
 	if err != nil {
@@ -126,6 +140,14 @@ func processDirectory(dir string) error {
 
 	for pkgDir, files := range packages {
 		if err := processPackage(pkgDir, files); err != nil {
+			return err
+		}
+	}
+	if *dryRun {
+		return nil
+	}
+	for moduleRoot := range moduleRoots {
+		if err := syncModuleDeps(moduleRoot); err != nil {
 			return err
 		}
 	}
@@ -543,10 +565,276 @@ func cleanupBlanks(content []byte) []byte {
 }
 
 func processFile(filename string) error {
-	return processPackage(filepath.Dir(filename), []string{filename})
+	if err := processPackage(filepath.Dir(filename), []string{filename}); err != nil {
+		return err
+	}
+	if *dryRun {
+		return nil
+	}
+	moduleRoot, err := findModuleRoot(filepath.Dir(filename))
+	if err != nil {
+		return err
+	}
+	if moduleRoot == "" {
+		return nil
+	}
+	return syncModuleDeps(moduleRoot)
 }
 
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "gotrace: %v\n", err)
 	os.Exit(1)
+}
+
+func findModuleRoot(dir string) (string, error) {
+	current := dir
+	for {
+		modPath := filepath.Join(current, "go.mod")
+		if _, err := os.Stat(modPath); err == nil {
+			abs, err := filepath.Abs(current)
+			if err != nil {
+				return "", err
+			}
+			return abs, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", nil
+		}
+		current = parent
+	}
+}
+
+func syncModuleDeps(moduleRoot string) error {
+	modPath := filepath.Join(moduleRoot, "go.mod")
+	content, err := os.ReadFile(modPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	modulePath, err := readModulePath(modPath)
+	if err != nil {
+		return err
+	}
+	if modulePath == traceModule {
+		return nil
+	}
+	needsTrace, err := moduleUsesTrace(moduleRoot)
+	if err != nil {
+		return err
+	}
+	mod, err := modfile.Parse(modPath, content, nil)
+	if err != nil {
+		return err
+	}
+
+	changed := false
+	if needsTrace {
+		localRoot := findLocalGotraceRoot()
+		traceVersion := resolveTraceVersion()
+		if localRoot == "" {
+			if traceVersion == "v0.0.0" {
+				return fmt.Errorf("unable to locate local %s module; run gotrace from its repo or install the module", traceModule)
+			}
+		} else {
+			replacePath := localRoot
+			if rel, err := filepath.Rel(moduleRoot, localRoot); err == nil {
+				replacePath = rel
+			}
+			if !hasReplace(mod, traceModule, replacePath) {
+				if err := mod.AddReplace(traceModule, "", replacePath, ""); err != nil {
+					return err
+				}
+				changed = true
+			}
+		}
+		if !hasRequire(mod, traceModule) {
+			if err := mod.AddRequire(traceModule, traceVersion); err != nil {
+				return err
+			}
+			changed = true
+		}
+		if mod.Go == nil || mod.Go.Version == "" {
+			if err := mod.AddGoStmt("1.21"); err != nil {
+				return err
+			}
+			changed = true
+		}
+	} else {
+		if dropRequire(mod, traceModule) {
+			changed = true
+		}
+		if dropReplace(mod, traceModule) {
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+	formatted, err := mod.Format()
+	if err != nil {
+		return err
+	}
+	if *dryRun {
+		fmt.Printf("  Would update: %s\n", modPath)
+		return nil
+	}
+	return os.WriteFile(modPath, formatted, 0644)
+}
+
+func moduleUsesTrace(moduleRoot string) (bool, error) {
+	var found bool
+	errFound := errors.New("trace import found")
+	err := filepath.WalkDir(moduleRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			base := filepath.Base(path)
+			if base == "vendor" || base == "testdata" || base == "cmd" || strings.HasPrefix(base, ".") {
+				return filepath.SkipDir
+			}
+			if path != moduleRoot {
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				} else if err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !bytes.Contains(content, []byte(tracePkg)) {
+			return nil
+		}
+		fset := token.NewFileSet()
+		node, err := parser.ParseFile(fset, path, content, parser.ImportsOnly)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		for _, imp := range node.Imports {
+			if imp.Path.Value == fmt.Sprintf("%q", tracePkg) {
+				found = true
+				return errFound
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errFound) {
+			return true, nil
+		}
+		return false, err
+	}
+	return found, nil
+}
+
+func findLocalGotraceRoot() string {
+	if root := findModuleRootByModulePathFromCwd(); root != "" {
+		return root
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		if root := findModuleRootByModulePath(filepath.Dir(exe)); root != "" {
+			return root
+		}
+	}
+	return ""
+}
+
+func readModulePath(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	mod, err := modfile.Parse(path, content, nil)
+	if err != nil {
+		return "", err
+	}
+	if mod.Module == nil {
+		return "", fmt.Errorf("module path not found in %s", path)
+	}
+	return mod.Module.Mod.Path, nil
+}
+
+func hasRequire(mod *modfile.File, path string) bool {
+	for _, req := range mod.Require {
+		if req.Mod.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasReplace(mod *modfile.File, oldPath, newPath string) bool {
+	for _, rep := range mod.Replace {
+		if rep.Old.Path != oldPath {
+			continue
+		}
+		if newPath == "" {
+			return true
+		}
+		if filepath.Clean(rep.New.Path) == filepath.Clean(newPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func dropRequire(mod *modfile.File, path string) bool {
+	if err := mod.DropRequire(path); err != nil {
+		return false
+	}
+	return true
+}
+
+func dropReplace(mod *modfile.File, path string) bool {
+	if err := mod.DropReplace(path, ""); err != nil {
+		return false
+	}
+	return true
+}
+
+func resolveTraceVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Path == traceModule {
+		if version := strings.TrimSpace(info.Main.Version); version != "" && version != "(devel)" {
+			return version
+		}
+	}
+	return "v0.0.0"
+}
+
+func findModuleRootByModulePathFromCwd() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return findModuleRootByModulePath(cwd)
+}
+
+func findModuleRootByModulePath(startDir string) string {
+	current := startDir
+	for {
+		modPath := filepath.Join(current, "go.mod")
+		modPathValue, err := readModulePath(modPath)
+		if err == nil && modPathValue == traceModule {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
 }
