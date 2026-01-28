@@ -11,7 +11,24 @@ import (
 
 var noop = func(...any) {}
 
+// Trace is a no-op stub, but checks for instrumentation without -tags debug
 func Trace(name string, args ...any) func(...any) {
+	// Runtime guard: detect if caller is instrumented
+	_, file, _, ok := runtime.Caller(1)
+	if ok && isInstrumented(file) {
+		fmt.Fprintln(os.Stderr, "\n⚠️  ERROR: Running instrumented code without -tags debug")
+		fmt.Fprintln(os.Stderr, "   This code has gotrace instrumentation but is running in production mode.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "   To run with tracing:  go run -tags debug .")
+		fmt.Fprintln(os.Stderr, "   To remove tracing:    gotrace --remove .")
+		fmt.Fprintln(os.Stderr, "")
+		os.Exit(1)
+	}
+	return noop
+}
+
+// TraceOnPanic is a no-op stub, but checks for instrumentation without -tags debug
+func TraceOnPanic(name string, args ...any) func(...any) {
 	// Runtime guard: detect if caller is instrumented
 	_, file, _, ok := runtime.Caller(1)
 	if ok && isInstrumented(file) {
