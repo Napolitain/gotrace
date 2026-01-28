@@ -30,6 +30,7 @@ var (
 	dryRun      = flag.Bool("dry-run", false, "show what would change without modifying")
 	verbose     = flag.Bool("verbose", false, "print detailed info")
 	pattern     = flag.String("pattern", "", "only instrument functions matching pattern")
+	filters     = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
 )
 
 func main() {
@@ -53,6 +54,7 @@ Examples:
   gotrace ./cmd/app    # Toggle in specific directory  
   gotrace --dry-run .  # Preview changes
   gotrace --remove .   # Force remove
+  gotrace --filters panic .  # Only show traces when panic occurs
 
 Running instrumented code:
   go run -tags debug .
@@ -339,12 +341,18 @@ func instrumentAST(node *ast.File) bool {
 			}
 		}
 
+		// Choose trace function based on filters
+		traceFuncName := "Trace"
+		if *filters == "panic" {
+			traceFuncName = "TraceOnPanic"
+		}
+
 		deferStmt := &ast.DeferStmt{
 			Call: &ast.CallExpr{
 				Fun: &ast.CallExpr{
 					Fun: &ast.SelectorExpr{
 						X:   ast.NewIdent("trace"),
-						Sel: ast.NewIdent("Trace"),
+						Sel: ast.NewIdent(traceFuncName),
 					},
 					Args: args,
 				},
@@ -440,7 +448,11 @@ func isTraceDefer(stmt ast.Stmt) bool {
 		return false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	return ok && id.Name == "trace" && sel.Sel.Name == "Trace"
+	if !ok || id.Name != "trace" {
+		return false
+	}
+	// Match both Trace and TraceOnPanic
+	return sel.Sel.Name == "Trace" || sel.Sel.Name == "TraceOnPanic"
 }
 
 func isTraceSummary(stmt ast.Stmt) bool {

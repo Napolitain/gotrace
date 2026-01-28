@@ -40,16 +40,20 @@ HotThresholdNs  int64 = 10_000_000  // 10ms
 )
 
 var (
-depth    int32
-mu       sync.Mutex
-traces   []Entry
-colorize = true
+	depth          int32
+	mu             sync.Mutex
+	traces         []Entry
+	colorize       = true
+	panicStacks    map[uint64][]string // Per-goroutine call stacks
+	panicMu        sync.Mutex
+	panicPrinted   bool
 )
 
 func init() {
-if os.Getenv("NO_COLOR") != "" {
-colorize = false
-}
+	if os.Getenv("NO_COLOR") != "" {
+		colorize = false
+	}
+	panicStacks = make(map[uint64][]string)
 }
 
 type Entry struct {
@@ -331,4 +335,88 @@ if len(s) <= max {
 return s
 }
 return s[:max-1] + "…"
+}
+
+
+// TraceOnPanic buffers traces and only outputs on panic
+func TraceOnPanic(name string, args ...any) func(...any) {
+	d := atomic.AddInt32(&depth, 1)
+	start := nanotime()
+	gid := getGID()
+	_, file, line, _ := runtime.Caller(1)
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		file = file[idx+1:]
+	}
+
+	indent := strings.Repeat("  ", int(d-1))
+	argsStr := ""
+	if len(args) > 0 {
+		argsStr = formatArgs(args)
+	}
+	
+	// Push entry onto this goroutine's stack
+	entryMsg := fmt.Sprintf("%s→ %s(%s) [%s:%d g%d]", indent, name, argsStr, file, line, gid)
+	panicMu.Lock()
+	panicStacks[gid] = append(panicStacks[gid], entryMsg)
+	panicMu.Unlock()
+
+	return func(returns ...any) {
+		end := nanotime()
+		dur := end - start
+
+		if r := recover(); r != nil {
+			// Panic detected - dump this goroutine's call stack (only once)
+			panicMu.Lock()
+			if !panicPrinted {
+				panicPrinted = true
+				fmt.Fprintln(os.Stderr, "\n"+panicStyle.Render("💥 PANIC DETECTED - Trace leading to panic:")+"\n")
+				if stack, exists := panicStacks[gid]; exists {
+					for _, msg := range stack {
+						fmt.Fprintln(os.Stderr, msg)
+					}
+				}
+				fmt.Fprintln(os.Stderr, "")
+			}
+			panicMu.Unlock()
+			
+			// Print the panic exit
+			printPanic(indent, name, dur, r)
+			
+			// Store in traces for analysis
+			mu.Lock()
+			traces = append(traces, Entry{
+				Name: name, Args: args, Returns: returns,
+				Depth: d, StartNs: start, EndNs: end, Duration: dur,
+				GID: gid, File: file, Line: line,
+				Panicked: true, PanicVal: r,
+			})
+			mu.Unlock()
+			
+			atomic.AddInt32(&depth, -1)
+			panic(r) // re-throw
+		}
+		
+		// Normal exit - pop this entry from stack
+		panicMu.Lock()
+		if stack, exists := panicStacks[gid]; exists && len(stack) > 0 {
+			// Pop: remove last entry (this function's entry)
+			panicStacks[gid] = stack[:len(stack)-1]
+			// Clean up empty stacks to prevent map growth
+			if len(panicStacks[gid]) == 0 {
+				delete(panicStacks, gid)
+			}
+		}
+		panicMu.Unlock()
+		
+		// Store in traces for analysis
+		mu.Lock()
+		traces = append(traces, Entry{
+			Name: name, Args: args, Returns: returns,
+			Depth: d, StartNs: start, EndNs: end, Duration: dur,
+			GID: gid, File: file, Line: line,
+		})
+		mu.Unlock()
+		
+		atomic.AddInt32(&depth, -1)
+	}
 }

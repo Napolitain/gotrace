@@ -12,6 +12,7 @@ A lean function tracer for Go with zero production overhead and pretty terminal 
 - 🎨 **Pretty terminal output** — Colored call trees with lipgloss
 - 🔥 **Hotpath detection** — Automatically highlights slow functions
 - 📊 **Summary statistics** — Call frequency, total time, averages
+- 💥 **Panic-only mode** — Buffer traces and only show them when a panic occurs
 - 🔒 **Safe workflow** — Cannot accidentally run instrumented code without knowing
 
 ## Installation
@@ -113,13 +114,55 @@ Flags:
   --dry-run   Preview changes without modifying files
   --verbose   Print detailed information
   --pattern   Only instrument functions matching pattern
+  --filters   Comma-separated filters (e.g. 'panic')
 
 Examples:
-  gotrace                 # Toggle instrumentation in current directory
-  gotrace ./cmd/myapp     # Toggle instrumentation in specific package
-  gotrace --dry-run .     # Preview changes
-  gotrace --remove .      # Force remove all instrumentation
+  gotrace                      # Toggle instrumentation in current directory
+  gotrace ./cmd/myapp          # Toggle instrumentation in specific package
+  gotrace --dry-run .          # Preview changes
+  gotrace --remove .           # Force remove all instrumentation
+  gotrace --filters panic .    # Only show traces when panic occurs
 ```
+
+## Filtering Modes
+
+### Panic-Only Mode
+
+By default, gotrace shows all function calls in real-time. With `--filters panic`, traces are buffered and only displayed when a panic occurs:
+
+```bash
+# Instrument with panic filter
+gotrace --filters panic .
+
+# Run - traces only appear if code panics
+go run -tags debug .
+```
+
+**Normal mode (default):**
+```
+→ main() [main.go:32 g1]
+  → goodFunc() [main.go:10 g1]
+  ← goodFunc 0ns
+  → anotherFunc() [main.go:15 g1]
+  ← anotherFunc 0ns
+  → badFunc() [main.go:20 g1]
+    💥 PANIC badFunc: something went wrong!
+```
+
+**Panic-only mode (`--filters panic`):**
+```
+(no output for successful calls)
+
+💥 PANIC DETECTED - Trace leading to panic:
+
+→ main() [main.go:32 g1]
+  → goodFunc() [main.go:10 g1]
+  ← goodFunc 0ns
+  → badFunc() [main.go:20 g1]
+    💥 PANIC badFunc: something went wrong!
+```
+
+This is perfect for production debugging - keep tracing instrumented but silent until something goes wrong!
 
 ## Manual Usage
 
