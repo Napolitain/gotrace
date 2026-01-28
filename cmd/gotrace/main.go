@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/format"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -25,293 +24,129 @@ const (
 )
 
 var (
-	forceAdd    = flag.Bool("add", false, "force add instrumentation")
-	forceRemove = flag.Bool("remove", false, "force remove instrumentation")
-	dryRun      = flag.Bool("dry-run", false, "show what would change without modifying")
-	verbose     = flag.Bool("verbose", false, "print detailed info")
-	pattern     = flag.String("pattern", "", "only instrument functions matching pattern")
-	filters     = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
+	dryRun  = flag.Bool("dry-run", false, "show what would change without modifying")
+	verbose = flag.Bool("verbose", false, "print detailed info")
+	pattern = flag.String("pattern", "", "only instrument functions matching pattern")
+	filters = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
 )
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `gotrace - Function tracing for Go
+		fmt.Fprintf(os.Stderr, `gotrace - Hot function tracing for Go
 
-Usage: gotrace [flags] [path]
+Usage: gotrace [flags] <target> [args...]
 
-Toggle instrumentation in your Go project. Run once to add tracing,
-run again to remove it. Instrumented code requires -tags debug to build.
+Instruments your Go code in-memory, compiles, and runs it with tracing enabled.
+No files are modified on disk.
 
 Arguments:
-  path    Directory or file (default: current directory)
+  target    Package directory to run (e.g., ".", "./cmd/app")
+  args      Arguments forwarded to the compiled program
 
 Flags:
 `)
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
 Examples:
-  gotrace              # Toggle in current directory
-  gotrace ./cmd/app    # Toggle in specific directory  
-  gotrace --dry-run .  # Preview changes
-  gotrace --remove .   # Force remove
-  gotrace --filters panic .  # Only show traces when panic occurs
-
-Running instrumented code:
-  go run -tags debug .
-  go build -tags debug -o myapp .
+  gotrace .                    # Run current directory with tracing
+  gotrace ./cmd/app            # Run specific package
+  gotrace ./cmd/app --port 80  # Run with arguments forwarded
+  gotrace --dry-run ./cmd/app  # Preview instrumentation without running
+  gotrace --filters panic .    # Only show traces when panic occurs
 `)
 	}
 	flag.Parse()
 
-	target := "."
-	if flag.NArg() > 0 {
-		target = flag.Arg(0)
+	if flag.NArg() < 1 {
+		fatal(fmt.Errorf("usage: gotrace <target> [args...]\nRun 'gotrace --help' for more information"))
 	}
 
-	if *forceAdd && *forceRemove {
-		fatal(fmt.Errorf("cannot use --add and --remove together"))
-	}
+	target := flag.Arg(0)
+	args := flag.Args()[1:] // Everything after target goes to the program
 
 	info, err := os.Stat(target)
 	if err != nil {
 		fatal(err)
 	}
-
-	if info.IsDir() {
-		err = processDirectory(target)
-	} else {
-		err = processFile(target)
+	if !info.IsDir() {
+		fatal(fmt.Errorf("target must be a directory containing a Go package"))
 	}
 
-	if err != nil {
+	if *dryRun {
+		if err := previewInstrumentation(target); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	if err := RunHot(target, args); err != nil {
 		fatal(err)
 	}
 }
 
-func processDirectory(dir string) error {
-	// Collect packages (directories with .go files)
-	packages := make(map[string][]string)
-	moduleRoots := make(map[string]struct{})
-
-	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		// Skip hidden dirs (but not . or ..), vendor, testdata
-		base := filepath.Base(path)
-		if fi.IsDir() {
-			if base == "vendor" || base == "testdata" {
-				return filepath.SkipDir
-			}
-			// Skip hidden directories, but allow . as starting point
-			if strings.HasPrefix(base, ".") && base != "." && base != ".." {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-		// Skip test files
-		if strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		// Skip files with build tags that exclude debug (the trace stub)
-		content, err := os.ReadFile(path)
-		if err == nil && bytes.Contains(content, []byte("//go:build !debug")) {
-			return nil
-		}
-		// Skip files with //go:build debug (already trace-enabled)
-		if err == nil && bytes.Contains(content, []byte("//go:build debug")) {
-			return nil
-		}
-		pkgDir := filepath.Dir(path)
-		packages[pkgDir] = append(packages[pkgDir], path)
-		moduleRoot, err := findModuleRoot(pkgDir)
-		if err != nil {
-			return err
-		}
-		if moduleRoot != "" {
-			moduleRoots[moduleRoot] = struct{}{}
-		}
-		return nil
-	})
+func previewInstrumentation(target string) error {
+	absTarget, err := filepath.Abs(target)
 	if err != nil {
 		return err
 	}
 
-	for pkgDir, files := range packages {
-		if err := processPackage(pkgDir, files); err != nil {
-			return err
-		}
-	}
-	if *dryRun {
-		return nil
-	}
-	for moduleRoot := range moduleRoots {
-		if err := syncModuleDeps(moduleRoot); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func processPackage(pkgDir string, files []string) error {
-	// Check if any file is instrumented
-	instrumented := false
-	for _, f := range files {
-		if isInstrumented(f) {
-			instrumented = true
-			break
-		}
-	}
-
-	// Determine action
-	shouldAdd := !instrumented
-	if *forceAdd {
-		shouldAdd = true
-	}
-	if *forceRemove {
-		shouldAdd = false
-	}
-
-	if shouldAdd {
-		return instrumentPackage(pkgDir, files)
-	}
-	return uninstrumentPackage(pkgDir, files)
-}
-
-func isInstrumented(filename string) bool {
-	content, err := os.ReadFile(filename)
+	moduleRoot, err := findModuleRoot(absTarget)
 	if err != nil {
-		return false
+		return err
 	}
-	return bytes.Contains(content, []byte(marker))
-}
-
-func instrumentPackage(pkgDir string, files []string) error {
-	if *verbose || *dryRun {
-		fmt.Printf("Instrumenting %s\n", pkgDir)
+	if moduleRoot == "" {
+		return fmt.Errorf("no go.mod found for %s", absTarget)
 	}
 
-	var pkgName string
-	for _, filename := range files {
-		content, err := os.ReadFile(filename)
+	fmt.Printf("Would instrument module at: %s\n", moduleRoot)
+	fmt.Printf("Target package: %s\n\n", absTarget)
+
+	return filepath.WalkDir(moduleRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+		if d.IsDir() {
+			base := filepath.Base(path)
+			if base == "vendor" || base == "testdata" || (strings.HasPrefix(base, ".") && base != "." && base != "..") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
 
-		// Skip already instrumented
-		if bytes.Contains(content, []byte(marker)) {
-			continue
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
 		}
 
 		fset := token.NewFileSet()
-		node, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
-		if err != nil {
-			return fmt.Errorf("parse %s: %w", filename, err)
+		node, parseErr := parser.ParseFile(fset, path, content, parser.ParseComments)
+		if parseErr != nil {
+			return nil // Skip unparseable files
 		}
 
-		pkgName = node.Name.Name
-
-		// Skip files with no functions
+		// Check if instrumentation would modify
 		hasFunc := false
 		ast.Inspect(node, func(n ast.Node) bool {
-			if _, ok := n.(*ast.FuncDecl); ok {
-				hasFunc = true
-				return false
+			if fn, ok := n.(*ast.FuncDecl); ok && fn.Body != nil && len(fn.Body.List) > 0 {
+				if *pattern == "" || strings.Contains(funcName(fn), *pattern) {
+					if !hasTraceDefer(fn.Body) {
+						hasFunc = true
+						return false
+					}
+				}
 			}
 			return true
 		})
-		if !hasFunc {
-			continue
-		}
 
-		// Instrument
-		modified := instrumentAST(node)
-		if !modified {
-			continue
+		if hasFunc {
+			rel, _ := filepath.Rel(moduleRoot, path)
+			fmt.Printf("  Would instrument: %s\n", rel)
 		}
-
-		// Format
-		var buf bytes.Buffer
-		if err := format.Node(&buf, fset, node); err != nil {
-			return fmt.Errorf("format %s: %w", filename, err)
-		}
-
-		// Add marker after package line
-		output := addMarker(buf.Bytes())
-
-		if *dryRun {
-			fmt.Printf("  Would modify: %s\n", filename)
-			continue
-		}
-
-		if err := os.WriteFile(filename, output, 0644); err != nil {
-			return err
-		}
-		if *verbose {
-			fmt.Printf("  Instrumented: %s\n", filename)
-		}
-	}
-
-	if pkgName == "" {
 		return nil
-	}
-
-	fmt.Printf("✓ Instrumented %s (run with: go run -tags debug .)\n", pkgDir)
-	return nil
-}
-
-func uninstrumentPackage(pkgDir string, files []string) error {
-	if *verbose || *dryRun {
-		fmt.Printf("Removing instrumentation from %s\n", pkgDir)
-	}
-
-	for _, filename := range files {
-		content, err := os.ReadFile(filename)
-		if err != nil {
-			return err
-		}
-
-		// Skip non-instrumented
-		if !bytes.Contains(content, []byte(marker)) {
-			continue
-		}
-
-		fset := token.NewFileSet()
-		node, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
-		if err != nil {
-			return fmt.Errorf("parse %s: %w", filename, err)
-		}
-
-		// Remove instrumentation
-		removeInstrumentation(node)
-
-		// Format
-		var buf bytes.Buffer
-		if err := format.Node(&buf, fset, node); err != nil {
-			return fmt.Errorf("format %s: %w", filename, err)
-		}
-
-		// Remove marker
-		output := removeMarker(buf.Bytes())
-
-		if *dryRun {
-			fmt.Printf("  Would restore: %s\n", filename)
-			continue
-		}
-
-		if err := os.WriteFile(filename, output, 0644); err != nil {
-			return err
-		}
-		if *verbose {
-			fmt.Printf("  Restored: %s\n", filename)
-		}
-	}
-
-	fmt.Printf("✓ Removed instrumentation from %s\n", pkgDir)
-	return nil
+	})
 }
 
 func instrumentAST(node *ast.File) bool {
@@ -574,23 +409,6 @@ func cleanupBlanks(content []byte) []byte {
 		prevBlank = isBlank
 	}
 	return bytes.Join(result, []byte("\n"))
-}
-
-func processFile(filename string) error {
-	if err := processPackage(filepath.Dir(filename), []string{filename}); err != nil {
-		return err
-	}
-	if *dryRun {
-		return nil
-	}
-	moduleRoot, err := findModuleRoot(filepath.Dir(filename))
-	if err != nil {
-		return err
-	}
-	if moduleRoot == "" {
-		return nil
-	}
-	return syncModuleDeps(moduleRoot)
 }
 
 func fatal(err error) {

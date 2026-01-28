@@ -1,19 +1,18 @@
 # ⚡ GoTrace
 
-A lean function tracer for Go with zero production overhead and pretty terminal output.
+A lean function tracer for Go with hot instrumentation and pretty terminal output.
 
 ![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ## Features
 
-- 🚀 **Zero runtime cost in production** — Uses build tags to compile out all tracing
+- 🔥 **Hot instrumentation** — Instruments code in-memory, no files modified on disk
 - ⏱️ **Nanosecond precision** — Uses `runtime.nanotime()` to avoid GC pressure  
 - 🎨 **Pretty terminal output** — Colored call trees with lipgloss
 - 🔥 **Hotpath detection** — Automatically highlights slow functions
 - 📊 **Summary statistics** — Call frequency, total time, averages
 - 💥 **Panic-only mode** — Buffer traces and only show them when a panic occurs
-- 🔒 **Safe workflow** — Cannot accidentally run instrumented code without knowing
 
 ## Installation
 
@@ -24,60 +23,45 @@ go install github.com/napolitain/gotrace/cmd/gotrace@latest
 ## Quick Start
 
 ```bash
-# 1. Instrument your project (toggle on)
-gotrace .
+# Run your Go program with tracing enabled
+gotrace ./cmd/myapp
 
-# 2. Run with tracing enabled
-go run -tags debug .
+# Run with arguments
+gotrace ./cmd/myapp --port 8080 --verbose
 
-# 3. Remove instrumentation (toggle off)
-gotrace .
+# Preview what would be instrumented
+gotrace --dry-run ./cmd/myapp
 ```
 
-That's it! Running `gotrace .` again toggles instrumentation off.
+That's it! One command instruments your code in-memory, compiles it, and runs it with full tracing.
 
 ## How It Works
 
-### Safety First
+When you run `gotrace ./cmd/myapp`:
 
-When you run instrumented code without `-tags debug`, gotrace detects it and exits with a helpful error:
+1. **Discovers** all Go files in your module
+2. **Instruments** them in-memory (adds `defer trace.Trace()` to functions)
+3. **Compiles** the instrumented code in a temporary directory
+4. **Runs** the binary, forwarding all arguments
+5. **Cleans up** the temporary files automatically
 
-```bash
-$ gotrace .
-✓ Instrumented myproject (run with: go run -tags debug .)
-
-$ go run .
-⚠️  ERROR: Running instrumented code without -tags debug
-   This code has gotrace instrumentation but is running in production mode.
-
-   To run with tracing:  go run -tags debug .
-   To remove tracing:    gotrace --remove .
-```
-
-This ensures you'll never accidentally run instrumented code in production.
+**No files are modified on disk** — your source code stays clean.
 
 ### Module Wiring
 
-When gotrace instruments a module, it also updates that module's `go.mod` to add a `require` and a local `replace` for `github.com/napolitain/gotrace` so examples run without manual `go get`. Removing instrumentation cleans those entries back out.
-
-### Toggle Workflow
-
-| State | `gotrace .` | `go run .` | `go run -tags debug .` |
-|-------|-------------|------------|------------------------|
-| Clean | Instruments | ✅ Runs | ✅ Runs |
-| Instrumented | Removes | ❌ Error | ✅ Runs with tracing |
+GoTrace automatically adds the required `require` and `replace` directives to a temporary copy of your `go.mod` so the trace package is available during compilation.
 
 ## Output Example
 
 ```
-→ main
-  → fibonacci(10)
-    → fibonacci(9)
-      → fibonacci(8)
+→ main() [main.go:10 g1]
+  → fibonacci(10) [main.go:21 g1]
+    → fibonacci(9) [main.go:21 g1]
+      → fibonacci(8) [main.go:21 g1]
         ← fibonacci 12.34µs
       ← fibonacci 45.67µs
-    ← fibonacci 89.01µs
-  ← fibonacci 156.78µs
+    ← fibonacci 89.01µs 
+  ← fibonacci 156.78ms 🔥 HOT
 Fibonacci(10) = 55
 
 ╔════════════════════╗
@@ -101,27 +85,26 @@ Fibonacci(10) = 55
 ## CLI Reference
 
 ```
-gotrace - Function tracing instrumentation for Go
+gotrace - Hot function tracing for Go
 
-Usage: gotrace [flags] [path]
+Usage: gotrace [flags] <target> [args...]
 
 Arguments:
-  path    Directory to instrument (default: current directory)
+  target    Package directory to run (e.g., ".", "./cmd/app")
+  args      Arguments forwarded to the compiled program
 
 Flags:
-  --add       Force add instrumentation
-  --remove    Force remove instrumentation
-  --dry-run   Preview changes without modifying files
+  --dry-run   Preview instrumentation without running
   --verbose   Print detailed information
   --pattern   Only instrument functions matching pattern
   --filters   Comma-separated filters (e.g. 'panic')
 
 Examples:
-  gotrace                      # Toggle instrumentation in current directory
-  gotrace ./cmd/myapp          # Toggle instrumentation in specific package
-  gotrace --dry-run .          # Preview changes
-  gotrace --remove .           # Force remove all instrumentation
-  gotrace --filters panic .    # Only show traces when panic occurs
+  gotrace .                      # Run current directory with tracing
+  gotrace ./cmd/myapp            # Run specific package
+  gotrace ./cmd/myapp --port 80  # Run with arguments forwarded
+  gotrace --dry-run ./cmd/myapp  # Preview what would be instrumented
+  gotrace --filters panic .      # Only show traces when panic occurs
 ```
 
 ## Filtering Modes
@@ -131,11 +114,8 @@ Examples:
 By default, gotrace shows all function calls in real-time. With `--filters panic`, traces are buffered and only displayed when a panic occurs:
 
 ```bash
-# Instrument with panic filter
-gotrace --filters panic .
-
-# Run - traces only appear if code panics
-go run -tags debug .
+# Run with panic filter
+gotrace --filters panic ./cmd/myapp
 ```
 
 **Normal mode (default):**
@@ -162,11 +142,11 @@ go run -tags debug .
     💥 PANIC badFunc: something went wrong!
 ```
 
-This is perfect for production debugging - keep tracing instrumented but silent until something goes wrong!
+This is perfect for debugging — keep tracing enabled but silent until something goes wrong!
 
 ## Manual Usage
 
-You can also use the trace package directly:
+You can also use the trace package directly in your code:
 
 ```go
 package main
@@ -186,12 +166,7 @@ func compute(n int) int {
 }
 ```
 
-Build with tracing:
-```bash
-go run -tags debug .
-```
-
-Build without tracing (zero overhead):
+Run with:
 ```bash
 go run .
 ```
@@ -226,10 +201,7 @@ trace.Reset()
 
 ## Performance
 
-| Mode | Overhead |
-|------|----------|
-| Production (`go build`) | **Zero** — stub functions are completely inlined away |
-| Debug (`go build -tags debug`) | ~100-500ns per traced call |
+The trace package adds ~100-500ns overhead per traced function call. This is designed for debugging and development — the overhead is negligible for understanding program behavior.
 
 ## Testing
 
@@ -237,7 +209,6 @@ Run standard tests:
 
 ```bash
 go test ./...
-go test -tags debug ./...
 ```
 
 Optional integration tests (requires submodule init):
@@ -246,18 +217,19 @@ Optional integration tests (requires submodule init):
 git submodule update --init --recursive
 go test -tags integration ./test/...
 ```
+
 ## Project Structure
 
 ```
 gotrace/
-├── cmd/gotrace/        # CLI instrumenter
+├── cmd/gotrace/        # CLI tool with hot instrumentation
+│   ├── main.go         # CLI entry point and AST instrumentation
+│   └── runner.go       # Hot run pipeline (copy, instrument, build, execute)
 ├── trace/
-│   ├── trace.go        # Active tracer (//go:build debug)
-│   └── trace_stub.go   # No-op stub (//go:build !debug)
+│   └── trace.go        # Tracer implementation
 └── example/            # Example usage
 ```
 
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
-

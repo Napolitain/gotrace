@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -16,27 +17,7 @@ const (
 	submoduleHello = "test/projects/golang-example/hello"
 )
 
-func TestGotraceIntegration_ToggleSubmodule(t *testing.T) {
-	root := repoRoot(t)
-	relativeSubmodule := filepath.FromSlash(submodulePath)
-	submodule := filepath.Join(root, relativeSubmodule)
-	if !isSubmoduleReady(submodule) {
-		t.Skip("submodule not initialized; run: git submodule update --init --recursive")
-	}
-
-	t.Cleanup(func() {
-		_ = runCmd(root, "go", "run", "./cmd/gotrace", "--remove", relativeSubmodule)
-	})
-
-	if err := runCmd(root, "go", "run", "./cmd/gotrace", "--add", relativeSubmodule); err != nil {
-		t.Fatalf("add instrumentation: %v", err)
-	}
-	if err := runCmd(root, "go", "run", "./cmd/gotrace", "--remove", relativeSubmodule); err != nil {
-		t.Fatalf("remove instrumentation: %v", err)
-	}
-}
-
-func TestGotraceIntegration_DebugBuild(t *testing.T) {
+func TestGotraceIntegration_HotRun(t *testing.T) {
 	root := repoRoot(t)
 	helloRel := filepath.FromSlash(submoduleHello)
 	helloPath := filepath.Join(root, helloRel)
@@ -44,22 +25,77 @@ func TestGotraceIntegration_DebugBuild(t *testing.T) {
 		t.Skip("submodule not initialized; run: git submodule update --init --recursive")
 	}
 
-	t.Cleanup(func() {
-		_ = runCmd(root, "go", "run", "./cmd/gotrace", "--remove", helloRel)
-	})
+	workFile := filepath.Join(t.TempDir(), "go.work")
+	if err := writeGoWork(workFile, root, helloPath); err != nil {
+		t.Fatalf("write go.work: %v", err)
+	}
+
+	// Run gotrace with hot instrumentation
+	output, err := runCmdOutput(root, "go", "run", "./cmd/gotrace", helloRel)
+	if err != nil {
+		t.Fatalf("hot run failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify trace output is present
+	if !strings.Contains(output, "→") || !strings.Contains(output, "←") {
+		t.Errorf("expected trace output with entry/exit arrows, got:\n%s", output)
+	}
+}
+
+func TestGotraceIntegration_DryRun(t *testing.T) {
+	root := repoRoot(t)
+	helloRel := filepath.FromSlash(submoduleHello)
+	helloPath := filepath.Join(root, helloRel)
+	if !isSubmoduleReady(helloPath) {
+		t.Skip("submodule not initialized; run: git submodule update --init --recursive")
+	}
+
+	// Run gotrace with --dry-run
+	output, err := runCmdOutput(root, "go", "run", "./cmd/gotrace", "--dry-run", helloRel)
+	if err != nil {
+		t.Fatalf("dry-run failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify dry-run output mentions files that would be instrumented
+	if !strings.Contains(output, "Would instrument") {
+		t.Errorf("expected dry-run output to mention 'Would instrument', got:\n%s", output)
+	}
+}
+
+func TestGotraceIntegration_NoFilesModified(t *testing.T) {
+	root := repoRoot(t)
+	helloRel := filepath.FromSlash(submoduleHello)
+	helloPath := filepath.Join(root, helloRel)
+	if !isSubmoduleReady(helloPath) {
+		t.Skip("submodule not initialized; run: git submodule update --init --recursive")
+	}
+
+	// Read original file content
+	helloGoPath := filepath.Join(helloPath, "hello.go")
+	originalContent, err := os.ReadFile(helloGoPath)
+	if err != nil {
+		t.Fatalf("read original file: %v", err)
+	}
 
 	workFile := filepath.Join(t.TempDir(), "go.work")
 	if err := writeGoWork(workFile, root, helloPath); err != nil {
 		t.Fatalf("write go.work: %v", err)
 	}
-	t.Setenv("GOWORK", workFile)
 
-	if err := runCmd(root, "go", "run", "./cmd/gotrace", "--add", helloRel); err != nil {
-		t.Fatalf("add instrumentation: %v", err)
+	// Run gotrace
+	_, err = runCmdOutput(root, "go", "run", "./cmd/gotrace", helloRel)
+	if err != nil {
+		t.Fatalf("hot run failed: %v", err)
 	}
 
-	if err := runCmd(helloPath, "go", "run", "-tags", "debug", "."); err != nil {
-		t.Fatalf("debug run: %v", err)
+	// Verify file was not modified
+	afterContent, err := os.ReadFile(helloGoPath)
+	if err != nil {
+		t.Fatalf("read file after run: %v", err)
+	}
+
+	if !bytes.Equal(originalContent, afterContent) {
+		t.Error("source file was modified on disk - hot instrumentation should not modify files")
 	}
 }
 
@@ -88,13 +124,24 @@ func isSubmoduleReady(path string) bool {
 	if err != nil || !info.IsDir() {
 		return false
 	}
-	if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+	// Check for .git file or directory (submodules use .git file pointing to parent)
+	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
+		return true
+	}
+	// Also check if there are any .go files (fallback for detached submodules)
+	entries, err := os.ReadDir(path)
+	if err != nil {
 		return false
 	}
-	return true
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".go") {
+			return true
+		}
+	}
+	return false
 }
 
-func runCmd(dir string, args ...string) error {
+func runCmdOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = dir
 
@@ -102,11 +149,8 @@ func runCmd(dir string, args ...string) error {
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%v: %s", err, output.String())
-	}
-
-	return nil
+	err := cmd.Run()
+	return output.String(), err
 }
 
 func writeGoWork(path, root, module string) error {

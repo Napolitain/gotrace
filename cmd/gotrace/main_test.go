@@ -1,119 +1,273 @@
 package main
 
 import (
-	"io/fs"
+	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestProcessDirectory_ToggleInstrumentation(t *testing.T) {
-	setFlags(false, false, false, "")
+func TestInstrumentAST_AddsDeferTrace(t *testing.T) {
+	src := `package main
 
-	tempDir := t.TempDir()
-	fixtureDir := filepath.Join("testdata", "fixtures", "project")
-	if err := copyDir(fixtureDir, tempDir); err != nil {
-		t.Fatalf("copy fixtures: %v", err)
-	}
-	goModPath := filepath.Join(tempDir, "go.mod")
-	if err := os.WriteFile(goModPath, []byte("module example.com/project\n\ngo 1.21\n"), 0644); err != nil {
-		t.Fatalf("write go.mod: %v", err)
-	}
-
-	if err := processDirectory(tempDir); err != nil {
-		t.Fatalf("instrument: %v", err)
-	}
-
-	mainPath := filepath.Join(tempDir, "main.go")
-	assertContains(t, mainPath, marker)
-	assertContains(t, mainPath, "defer trace.Trace(\"main\")()")
-	assertContains(t, mainPath, "trace.PrintSummary()")
-	assertContains(t, mainPath, tracePkg)
-
-	helperPath := filepath.Join(tempDir, "helper.go")
-	assertContains(t, helperPath, "defer trace.Trace(\"fibonacci\", n)()")
-
-	methodPath := filepath.Join(tempDir, "methods.go")
-	assertContains(t, methodPath, "defer trace.Trace(\"Calculator.Add\", a, b)()")
-
-	subPath := filepath.Join(tempDir, "subpkg", "sub.go")
-	assertContains(t, subPath, "defer trace.Trace(\"Do\", n)()")
-
-	assertNotContains(t, filepath.Join(tempDir, "nofunc.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, "buildtag_debug.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, "buildtag_nodebug.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, "file_test.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, "vendor", "vendor.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, "testdata", "skip.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, "cmd", "app", "app.go"), marker)
-	assertNotContains(t, filepath.Join(tempDir, ".hidden", "hidden.go"), marker)
-	assertContains(t, goModPath, traceModule)
-
-	if err := processDirectory(tempDir); err != nil {
-		t.Fatalf("uninstrument: %v", err)
-	}
-
-	assertNotContains(t, mainPath, marker)
-	assertNotContains(t, mainPath, "trace.Trace")
-	assertNotContains(t, mainPath, "trace.PrintSummary")
-	assertNotContains(t, mainPath, tracePkg)
-	assertNotContains(t, helperPath, "trace.Trace")
-	assertNotContains(t, methodPath, "trace.Trace")
-	assertNotContains(t, subPath, "trace.Trace")
-	assertNotContains(t, goModPath, traceModule)
+func hello() {
+	println("hello")
 }
-
-func setFlags(add, remove, dry bool, pat string) {
-	*forceAdd = add
-	*forceRemove = remove
-	*dryRun = dry
-	*verbose = false
-	*pattern = pat
-}
-
-func copyDir(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0755)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, 0644)
-	})
-}
-
-func assertContains(t *testing.T, path, needle string) {
-	t.Helper()
-	content := readFile(t, path)
-	if !strings.Contains(content, needle) {
-		t.Fatalf("expected %s to contain %q", path, needle)
-	}
-}
-
-func assertNotContains(t *testing.T, path, needle string) {
-	t.Helper()
-	content := readFile(t, path)
-	if strings.Contains(content, needle) {
-		t.Fatalf("expected %s to not contain %q", path, needle)
-	}
-}
-
-func readFile(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
+`
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		t.Fatalf("parse: %v", err)
 	}
-	return string(data)
+
+	modified := instrumentAST(node)
+	if !modified {
+		t.Fatal("expected AST to be modified")
+	}
+
+	// Check that defer trace.Trace was added
+	var hasTraceDefer bool
+	ast.Inspect(node, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Name.Name == "hello" {
+			if len(fn.Body.List) > 0 {
+				if isTraceDefer(fn.Body.List[0]) {
+					hasTraceDefer = true
+				}
+			}
+		}
+		return true
+	})
+
+	if !hasTraceDefer {
+		t.Fatal("expected defer trace.Trace to be added")
+	}
+}
+
+func TestInstrumentAST_SkipsAlreadyInstrumented(t *testing.T) {
+	src := `package main
+
+import "github.com/napolitain/gotrace/trace"
+
+func hello() {
+	defer trace.Trace("hello")()
+	println("hello")
+}
+`
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	modified := instrumentAST(node)
+	if modified {
+		t.Fatal("expected AST to not be modified for already instrumented code")
+	}
+}
+
+func TestInstrumentAST_InstrumentsWithArgs(t *testing.T) {
+	src := `package main
+
+func add(a, b int) int {
+	return a + b
+}
+`
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	modified := instrumentAST(node)
+	if !modified {
+		t.Fatal("expected AST to be modified")
+	}
+
+	// Verify the function was instrumented
+	var deferStmt *ast.DeferStmt
+	ast.Inspect(node, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Name.Name == "add" {
+			if len(fn.Body.List) > 0 {
+				if d, ok := fn.Body.List[0].(*ast.DeferStmt); ok {
+					deferStmt = d
+				}
+			}
+		}
+		return true
+	})
+
+	if deferStmt == nil {
+		t.Fatal("expected defer statement to be added")
+	}
+}
+
+func TestInstrumentAST_AddsPrintSummaryToMain(t *testing.T) {
+	src := `package main
+
+func main() {
+	println("hello")
+}
+`
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	modified := instrumentAST(node)
+	if !modified {
+		t.Fatal("expected AST to be modified")
+	}
+
+	// Check that PrintSummary was added to main
+	var hasPrintSummary bool
+	ast.Inspect(node, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Name.Name == "main" {
+			for _, stmt := range fn.Body.List {
+				if isTraceSummary(stmt) {
+					hasPrintSummary = true
+				}
+			}
+		}
+		return true
+	})
+
+	if !hasPrintSummary {
+		t.Fatal("expected trace.PrintSummary to be added to main")
+	}
+}
+
+func TestInstrumentFile_ReturnsOriginalIfNoFunctions(t *testing.T) {
+	src := `package main
+
+var x = 42
+`
+	result, err := instrumentFile("test.go", []byte(src))
+	if err != nil {
+		t.Fatalf("instrumentFile: %v", err)
+	}
+
+	if !bytes.Equal(result, []byte(src)) {
+		t.Fatal("expected original content to be returned for file without functions")
+	}
+}
+
+func TestInstrumentFile_HandlesMethodReceivers(t *testing.T) {
+	src := `package main
+
+type Calculator struct{}
+
+func (c *Calculator) Add(a, b int) int {
+	return a + b
+}
+`
+	result, err := instrumentFile("test.go", []byte(src))
+	if err != nil {
+		t.Fatalf("instrumentFile: %v", err)
+	}
+
+	if !strings.Contains(string(result), `trace.Trace("Calculator.Add"`) {
+		t.Fatalf("expected method receiver to be included in trace name, got:\n%s", result)
+	}
+}
+
+func TestFuncName_ReturnsCorrectNames(t *testing.T) {
+	tests := []struct {
+		src      string
+		expected string
+	}{
+		{`package main; func hello() {}`, "hello"},
+		{`package main; type T struct{}; func (t T) Method() {}`, "T.Method"},
+		{`package main; type T struct{}; func (t *T) Method() {}`, "T.Method"},
+	}
+
+	for _, tt := range tests {
+		fset := token.NewFileSet()
+		node, err := parser.ParseFile(fset, "test.go", tt.src, 0)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+
+		var name string
+		ast.Inspect(node, func(n ast.Node) bool {
+			if fn, ok := n.(*ast.FuncDecl); ok {
+				name = funcName(fn)
+				return false
+			}
+			return true
+		})
+
+		if name != tt.expected {
+			t.Errorf("funcName() = %q, want %q", name, tt.expected)
+		}
+	}
+}
+
+func TestCopyAndInstrumentModule_SkipsVendorAndTestdata(t *testing.T) {
+	tempSrc := t.TempDir()
+	tempDst := t.TempDir()
+
+	// Create a minimal module structure
+	os.WriteFile(filepath.Join(tempSrc, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644)
+	os.WriteFile(filepath.Join(tempSrc, "main.go"), []byte("package main\n\nfunc main() {\n\tprintln(\"hi\")\n}\n"), 0644)
+	
+	os.MkdirAll(filepath.Join(tempSrc, "vendor"), 0755)
+	os.WriteFile(filepath.Join(tempSrc, "vendor", "vendor.go"), []byte("package vendor\n"), 0644)
+	
+	os.MkdirAll(filepath.Join(tempSrc, "testdata"), 0755)
+	os.WriteFile(filepath.Join(tempSrc, "testdata", "test.go"), []byte("package testdata\n"), 0644)
+
+	err := copyAndInstrumentModule(tempSrc, tempDst)
+	if err != nil {
+		t.Fatalf("copyAndInstrumentModule: %v", err)
+	}
+
+	// vendor and testdata should not be copied
+	if _, err := os.Stat(filepath.Join(tempDst, "vendor")); !os.IsNotExist(err) {
+		t.Error("vendor directory should not be copied")
+	}
+	if _, err := os.Stat(filepath.Join(tempDst, "testdata")); !os.IsNotExist(err) {
+		t.Error("testdata directory should not be copied")
+	}
+
+	// main.go should be instrumented
+	content, _ := os.ReadFile(filepath.Join(tempDst, "main.go"))
+	if !strings.Contains(string(content), "trace.Trace") {
+		t.Error("main.go should be instrumented")
+	}
+}
+
+func TestPreviewInstrumentation_ListsFilesToInstrument(t *testing.T) {
+	// Create temp directory with a simple Go file
+	tempDir := t.TempDir()
+	os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte("module test\n\ngo 1.21\n"), 0644)
+	os.WriteFile(filepath.Join(tempDir, "main.go"), []byte("package main\n\nfunc main() {\n\tprintln(\"hi\")\n}\n"), 0644)
+
+	// Capture output
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	*dryRun = true
+	err := previewInstrumentation(tempDir)
+	*dryRun = false
+
+	w.Close()
+	os.Stdout = old
+
+	if err != nil {
+		t.Fatalf("previewInstrumentation: %v", err)
+	}
+
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+	output := buf.String()
+
+	if !strings.Contains(output, "main.go") {
+		t.Errorf("expected output to mention main.go, got:\n%s", output)
+	}
 }
