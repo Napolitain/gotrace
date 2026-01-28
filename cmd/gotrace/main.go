@@ -95,10 +95,10 @@ func processDirectory(dir string) error {
 		if err != nil {
 			return err
 		}
-		// Skip hidden dirs (but not . or ..), vendor, testdata, cmd
+		// Skip hidden dirs (but not . or ..), vendor, testdata
 		base := filepath.Base(path)
 		if fi.IsDir() {
-			if base == "vendor" || base == "testdata" || base == "cmd" {
+			if base == "vendor" || base == "testdata" {
 				return filepath.SkipDir
 			}
 			// Skip hidden directories, but allow . as starting point
@@ -696,7 +696,7 @@ func moduleUsesTrace(moduleRoot string) (bool, error) {
 		}
 		if d.IsDir() {
 			base := filepath.Base(path)
-			if base == "vendor" || base == "testdata" || base == "cmd" || strings.HasPrefix(base, ".") {
+			if base == "vendor" || base == "testdata" || strings.HasPrefix(base, ".") {
 				return filepath.SkipDir
 			}
 			if path != moduleRoot {
