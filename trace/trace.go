@@ -3,6 +3,7 @@ package trace
 import (
 	"cmp"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"slices"
@@ -346,6 +347,100 @@ func PrintSummary() {
 	}
 	sb.WriteString("\n")
 	fmt.Print(sb.String())
+}
+
+// PrintFunctionStats displays detailed statistics for a specific function.
+// This is used with --function flag for micro-benchmark mode.
+func PrintFunctionStats(name string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Filter entries for the target function
+	var durations []int64
+	for _, e := range traces {
+		if e.Name == name {
+			durations = append(durations, e.Duration)
+		}
+	}
+
+	if len(durations) == 0 {
+		fmt.Printf("\n🎯 Function: %s\n", name)
+		fmt.Println("  No invocations recorded")
+		return
+	}
+
+	// Sort for percentile calculations
+	slices.Sort(durations)
+
+	// Calculate statistics
+	count := len(durations)
+	var total int64
+	for _, d := range durations {
+		total += d
+	}
+
+	minD := durations[0]
+	maxD := durations[count-1]
+	mean := total / int64(count)
+
+	// Median
+	var median int64
+	if count%2 == 0 {
+		median = (durations[count/2-1] + durations[count/2]) / 2
+	} else {
+		median = durations[count/2]
+	}
+
+	// Percentiles (with bounds checking)
+	p95Idx := int(float64(count-1) * 0.95)
+	p99Idx := int(float64(count-1) * 0.99)
+	p95 := durations[p95Idx]
+	p99 := durations[p99Idx]
+
+	// Standard deviation
+	var variance float64
+	meanF := float64(mean)
+	for _, d := range durations {
+		diff := float64(d) - meanF
+		variance += diff * diff
+	}
+	variance /= float64(count)
+	stdDev := int64(math.Sqrt(variance))
+
+	// Build output
+	var sb strings.Builder
+	sb.WriteString("\n" + titleStyle.Render("🎯 Function Micro-Benchmark") + "\n\n")
+	sb.WriteString(fmt.Sprintf("  Function: %s\n", funcStyle.Render(name)))
+	sb.WriteString(fileStyle.Render("  "+strings.Repeat("─", 60)) + "\n")
+
+	sb.WriteString(fmt.Sprintf("  Invocations:     %s\n", argsStyle.Render(fmt.Sprintf("%d", count))))
+	sb.WriteString(fmt.Sprintf("  Total Time:      %s\n\n", fastStyle.Render(formatDuration(total))))
+
+	sb.WriteString(headerStyle.Render("  📊 Timing Distribution") + "\n")
+	sb.WriteString(fileStyle.Render("  "+strings.Repeat("─", 60)) + "\n")
+
+	sb.WriteString(fmt.Sprintf("    Min:           %s\n", fastStyle.Render(formatDuration(minD))))
+	sb.WriteString(fmt.Sprintf("    Max:           %s\n", colorDuration(maxD)))
+	sb.WriteString(fmt.Sprintf("    Mean:          %s\n", colorDuration(mean)))
+	sb.WriteString(fmt.Sprintf("    Median:        %s\n", colorDuration(median)))
+	sb.WriteString(fmt.Sprintf("    P95:           %s\n", colorDuration(p95)))
+	sb.WriteString(fmt.Sprintf("    P99:           %s\n", colorDuration(p99)))
+	sb.WriteString(fmt.Sprintf("    Std Dev:       %s\n", fastStyle.Render(formatDuration(stdDev))))
+
+	sb.WriteString("\n")
+	fmt.Print(sb.String())
+}
+
+// colorDuration formats duration with color based on thresholds.
+func colorDuration(d int64) string {
+	hotThreshold := hotThresholdNs.Load()
+	warnThreshold := warnThresholdNs.Load()
+	if d >= hotThreshold {
+		return hotStyle.Render(formatDuration(d))
+	} else if d >= warnThreshold {
+		return warmStyle.Render(formatDuration(d))
+	}
+	return fastStyle.Render(formatDuration(d))
 }
 
 func truncate(s string, max int) string {

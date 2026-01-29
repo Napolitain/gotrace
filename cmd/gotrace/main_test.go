@@ -281,7 +281,7 @@ func TestPreviewInstrumentation_ListsFilesToInstrument(t *testing.T) {
 }
 
 func TestInstrumentAST_WithAllowedFuncs(t *testing.T) {
-	t.Parallel()
+	// NOTE: Not parallel because it modifies global allowedFuncs
 	src := `package main
 
 func main() {

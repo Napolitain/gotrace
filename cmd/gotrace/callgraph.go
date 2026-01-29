@@ -191,3 +191,77 @@ func formatFuncName(fn *ssa.Function) string {
 
 	return name
 }
+
+// findCalleesFrom finds all functions called by the source function (and their callees).
+// It returns a set of function names (including receiver types for methods).
+func findCalleesFrom(graph *callgraph.Graph, prog *ssa.Program, source string) (map[string]bool, error) {
+	// Find the source node(s) in the graph
+	sourceNodes := findFunctionNodes(graph, prog, source)
+	if len(sourceNodes) == 0 {
+		return nil, fmt.Errorf("function %q not found in call graph", source)
+	}
+
+	// BFS forward from source to find all callees
+	callees := make(map[string]bool)
+	visited := make(map[*callgraph.Node]bool)
+	queue := make([]*callgraph.Node, 0, len(sourceNodes))
+
+	for _, node := range sourceNodes {
+		queue = append(queue, node)
+		visited[node] = true
+		callees[formatFuncName(node.Func)] = true
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Visit all callees (outgoing edges)
+		for _, edge := range current.Out {
+			callee := edge.Callee
+			if callee == nil || visited[callee] {
+				continue
+			}
+			visited[callee] = true
+
+			name := formatFuncName(callee.Func)
+			if name != "" && name != "<root>" {
+				callees[name] = true
+			}
+
+			queue = append(queue, callee)
+		}
+	}
+
+	return callees, nil
+}
+
+// findPathSegment finds functions in the call path FROM source TO target.
+// It intersects callers of target with callees of source.
+func findPathSegment(graph *callgraph.Graph, prog *ssa.Program, source, target string) (map[string]bool, error) {
+	// Get all callees from source (forward)
+	callees, err := findCalleesFrom(graph, prog, source)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get all callers to target (backward)
+	callers, err := findCallersTo(graph, prog, target)
+	if err != nil {
+		return nil, err
+	}
+
+	// Intersect: only functions that are both reachable from source AND lead to target
+	segment := make(map[string]bool)
+	for fn := range callees {
+		if callers[fn] {
+			segment[fn] = true
+		}
+	}
+
+	if len(segment) == 0 {
+		return nil, fmt.Errorf("no call path found from %q to %q", source, target)
+	}
+
+	return segment, nil
+}

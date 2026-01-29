@@ -21,11 +21,14 @@ const (
 )
 
 var (
-	dryRun  = flag.Bool("dry-run", false, "show what would change without modifying")
-	verbose = flag.Bool("verbose", false, "print detailed info")
-	pattern = flag.String("pattern", "", "only instrument functions matching pattern")
-	filters = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
-	until   = flag.String("until", "", "only instrument call path to this function")
+	dryRun       = flag.Bool("dry-run", false, "show what would change without modifying")
+	verbose      = flag.Bool("verbose", false, "print detailed info")
+	pattern      = flag.String("pattern", "", "only instrument functions matching pattern")
+	filters      = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
+	until        = flag.String("until", "", "only instrument call path to this function")
+	from         = flag.String("from", "", "trace from this function (use with --until for segments)")
+	pmu          = flag.Bool("pmu", false, "collect hardware performance counters (Linux only)")
+	functionFlag = flag.String("function", "", "micro-benchmark a specific function only")
 )
 
 func main() {
@@ -52,6 +55,7 @@ Examples:
   gotrace --dry-run ./cmd/app     # Preview instrumentation without running
   gotrace --filters panic .       # Only show traces when panic occurs
   gotrace --until "DB.Query" .    # Only trace call path to DB.Query
+  gotrace --pmu .                 # Include hardware performance counters (Linux)
 `)
 	}
 	flag.Parse()
@@ -149,7 +153,11 @@ func previewInstrumentation(target string) error {
 }
 
 // allowedFuncs is set when --until is used to filter instrumentation to call path only.
+// allowedFuncs restricts instrumentation to specific functions when --until is used.
 var allowedFuncs map[string]bool
+
+// targetFunction is set when --function is used for micro-benchmark mode.
+var targetFunction string
 
 func instrumentAST(node *ast.File) bool {
 	modified := false
@@ -166,6 +174,10 @@ func instrumentAST(node *ast.File) bool {
 		}
 		// If --until is specified, only instrument functions in the call path
 		if allowedFuncs != nil && !allowedFuncs[name] {
+			return true
+		}
+		// If --function is specified, only instrument that specific function
+		if targetFunction != "" && name != targetFunction {
 			return true
 		}
 		if hasTraceDefer(fn.Body) {
@@ -209,16 +221,28 @@ func instrumentAST(node *ast.File) bool {
 		addImport(node, tracePkg)
 	}
 
-	// Add PrintSummary to main if present
+	// Add PrintSummary or PrintFunctionStats to main if present
 	ast.Inspect(node, func(n ast.Node) bool {
 		fn, ok := n.(*ast.FuncDecl)
 		if !ok || fn.Name.Name != "main" || fn.Recv != nil {
 			return true
 		}
-		summaryCall := &ast.ExprStmt{
-			X: &ast.CallExpr{
-				Fun: &ast.SelectorExpr{X: ast.NewIdent("trace"), Sel: ast.NewIdent("PrintSummary")},
-			},
+		var summaryCall *ast.ExprStmt
+		if targetFunction != "" {
+			// --function mode: use PrintFunctionStats
+			summaryCall = &ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun:  &ast.SelectorExpr{X: ast.NewIdent("trace"), Sel: ast.NewIdent("PrintFunctionStats")},
+					Args: []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: fmt.Sprintf("%q", targetFunction)}},
+				},
+			}
+		} else {
+			// Normal mode: use PrintSummary
+			summaryCall = &ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun: &ast.SelectorExpr{X: ast.NewIdent("trace"), Sel: ast.NewIdent("PrintSummary")},
+				},
+			}
 		}
 		fn.Body.List = append(fn.Body.List, summaryCall)
 		return false

@@ -34,6 +34,11 @@ func RunHot(target string, args []string) error {
 		return fmt.Errorf("target must be a directory containing a Go package")
 	}
 
+	// Validate flag combinations
+	if *functionFlag != "" && (*from != "" || *until != "") {
+		return fmt.Errorf("--function cannot be used with --from or --until")
+	}
+
 	// Find module root
 	moduleRoot, err := findModuleRoot(absTarget)
 	if err != nil {
@@ -43,23 +48,62 @@ func RunHot(target string, args []string) error {
 		return fmt.Errorf("no go.mod found for %s", absTarget)
 	}
 
-	// If --until is specified, build call graph and find functions to instrument
-	if *until != "" {
+	// Handle call graph filtering based on --from and --until flags
+	if *from != "" || *until != "" {
 		if *verbose {
-			fmt.Printf("Building call graph to find path to %q...\n", *until)
+			if *from != "" && *until != "" {
+				fmt.Printf("Building call graph to find path from %q to %q...\n", *from, *until)
+			} else if *from != "" {
+				fmt.Printf("Building call graph to find callees from %q...\n", *from)
+			} else {
+				fmt.Printf("Building call graph to find path to %q...\n", *until)
+			}
 		}
+
 		graph, prog, err := buildCallGraph(moduleRoot)
 		if err != nil {
 			return fmt.Errorf("build call graph: %w", err)
 		}
-		callers, err := findCallersTo(graph, prog, *until)
-		if err != nil {
-			return fmt.Errorf("find callers: %w", err)
+
+		var funcs map[string]bool
+		switch {
+		case *from != "" && *until != "":
+			// Path segment: from source to target
+			funcs, err = findPathSegment(graph, prog, *from, *until)
+			if err != nil {
+				return fmt.Errorf("find path segment: %w", err)
+			}
+			if *verbose {
+				fmt.Printf("Will instrument %d functions in path from %q to %q\n", len(funcs), *from, *until)
+			}
+		case *from != "":
+			// Forward: from source to all callees
+			funcs, err = findCalleesFrom(graph, prog, *from)
+			if err != nil {
+				return fmt.Errorf("find callees: %w", err)
+			}
+			if *verbose {
+				fmt.Printf("Will instrument %d functions called from %q\n", len(funcs), *from)
+			}
+		default:
+			// Backward: all callers to target (existing behavior)
+			funcs, err = findCallersTo(graph, prog, *until)
+			if err != nil {
+				return fmt.Errorf("find callers: %w", err)
+			}
+			if *verbose {
+				fmt.Printf("Will instrument functions in call path to %q\n", *until)
+			}
 		}
+		allowedFuncs = funcs
+	}
+
+	// If --function is specified, only instrument that function
+	if *functionFlag != "" {
 		if *verbose {
-			fmt.Printf("Will instrument functions in call path to %q\n", *until)
+			fmt.Printf("Micro-benchmark mode: only tracing %q\n", *functionFlag)
 		}
-		allowedFuncs = callers
+		targetFunction = *functionFlag
 	}
 
 	// Create temp directory for instrumented code
@@ -273,12 +317,18 @@ func runBinary(binaryPath string, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	// Setup PMU counters (will be inherited by child with enable_on_exec)
+	if err := InitPMUForChild(); err != nil {
+		return fmt.Errorf("setup PMU: %w", err)
+	}
+
 	// Handle signals - forward to child process
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	if err := cmd.Start(); err != nil {
 		signal.Stop(sigCh)
+		ReadAndClosePMU() // cleanup PMU on error
 		return fmt.Errorf("start: %w", err)
 	}
 
@@ -304,12 +354,20 @@ func runBinary(binaryPath string, args []string) error {
 	signal.Stop(sigCh)
 	close(done)
 
+	// Read PMU counters after child exits
+	pmuCounters := ReadAndClosePMU()
+
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			// Print PMU summary even on non-zero exit
+			PrintPMUSummary(pmuCounters)
 			os.Exit(exitErr.ExitCode())
 		}
 		return err
 	}
+
+	// Print PMU summary
+	PrintPMUSummary(pmuCounters)
 
 	return nil
 }
