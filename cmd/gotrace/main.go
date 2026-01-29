@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -18,7 +16,6 @@ import (
 )
 
 const (
-	marker      = "// +gotrace:instrumented"
 	traceModule = "github.com/napolitain/gotrace"
 	tracePkg    = traceModule + "/trace"
 )
@@ -28,6 +25,7 @@ var (
 	verbose = flag.Bool("verbose", false, "print detailed info")
 	pattern = flag.String("pattern", "", "only instrument functions matching pattern")
 	filters = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
+	until   = flag.String("until", "", "only instrument call path to this function")
 )
 
 func main() {
@@ -48,11 +46,12 @@ Flags:
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, `
 Examples:
-  gotrace .                    # Run current directory with tracing
-  gotrace ./cmd/app            # Run specific package
-  gotrace ./cmd/app --port 80  # Run with arguments forwarded
-  gotrace --dry-run ./cmd/app  # Preview instrumentation without running
-  gotrace --filters panic .    # Only show traces when panic occurs
+  gotrace .                       # Run current directory with tracing
+  gotrace ./cmd/app               # Run specific package
+  gotrace ./cmd/app --port 80     # Run with arguments forwarded
+  gotrace --dry-run ./cmd/app     # Preview instrumentation without running
+  gotrace --filters panic .       # Only show traces when panic occurs
+  gotrace --until "DB.Query" .    # Only trace call path to DB.Query
 `)
 	}
 	flag.Parse()
@@ -149,6 +148,9 @@ func previewInstrumentation(target string) error {
 	})
 }
 
+// allowedFuncs is set when --until is used to filter instrumentation to call path only.
+var allowedFuncs map[string]bool
+
 func instrumentAST(node *ast.File) bool {
 	modified := false
 
@@ -160,6 +162,10 @@ func instrumentAST(node *ast.File) bool {
 
 		name := funcName(fn)
 		if *pattern != "" && !strings.Contains(name, *pattern) {
+			return true
+		}
+		// If --until is specified, only instrument functions in the call path
+		if allowedFuncs != nil && !allowedFuncs[name] {
 			return true
 		}
 		if hasTraceDefer(fn.Body) {
@@ -219,26 +225,6 @@ func instrumentAST(node *ast.File) bool {
 	})
 
 	return modified
-}
-
-func removeInstrumentation(node *ast.File) {
-	ast.Inspect(node, func(n ast.Node) bool {
-		fn, ok := n.(*ast.FuncDecl)
-		if !ok || fn.Body == nil {
-			return true
-		}
-
-		var filtered []ast.Stmt
-		for _, stmt := range fn.Body.List {
-			if !isTraceDefer(stmt) && !isTraceSummary(stmt) {
-				filtered = append(filtered, stmt)
-			}
-		}
-		fn.Body.List = filtered
-		return true
-	})
-
-	removeImport(node, tracePkg)
 }
 
 func funcName(fn *ast.FuncDecl) string {
@@ -331,86 +317,6 @@ func addImport(node *ast.File, path string) {
 	}}, node.Decls...)
 }
 
-func removeImport(node *ast.File, path string) {
-	quoted := fmt.Sprintf("%q", path)
-	for i, decl := range node.Decls {
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.IMPORT {
-			continue
-		}
-		var kept []ast.Spec
-		for _, spec := range gen.Specs {
-			imp, ok := spec.(*ast.ImportSpec)
-			if !ok || imp.Path.Value != quoted {
-				kept = append(kept, spec)
-			}
-		}
-		gen.Specs = kept
-		if len(kept) == 0 {
-			node.Decls = append(node.Decls[:i], node.Decls[i+1:]...)
-		}
-		return
-	}
-}
-
-func addMarker(content []byte) []byte {
-	lines := bytes.Split(content, []byte("\n"))
-	var result [][]byte
-	for i, line := range lines {
-		result = append(result, line)
-		// Add marker after package line
-		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("package ")) {
-			result = append(result, []byte(marker))
-			result = append(result, lines[i+1:]...)
-			break
-		}
-	}
-	return bytes.Join(result, []byte("\n"))
-}
-
-func removeMarker(content []byte) []byte {
-	lines := bytes.Split(content, []byte("\n"))
-	var result [][]byte
-	for _, line := range lines {
-		if bytes.Equal(bytes.TrimSpace(line), []byte(marker)) {
-			continue
-		}
-		result = append(result, line)
-	}
-	return cleanupBlanks(bytes.Join(result, []byte("\n")))
-}
-
-func cleanupBlanks(content []byte) []byte {
-	// Clean consecutive blank lines and blank lines after opening braces or before closing braces
-	lines := bytes.Split(content, []byte("\n"))
-	var result [][]byte
-	prevBlank := false
-	for i, line := range lines {
-		isBlank := len(bytes.TrimSpace(line)) == 0
-		// Skip blank line after opening brace
-		if isBlank && i > 0 {
-			prevLine := bytes.TrimSpace(lines[i-1])
-			if bytes.HasSuffix(prevLine, []byte("{")) {
-				continue
-			}
-		}
-		// Skip blank line before closing brace
-		if isBlank && i+1 < len(lines) {
-			nextLine := bytes.TrimSpace(lines[i+1])
-			if bytes.HasPrefix(nextLine, []byte("}")) {
-				continue
-			}
-		}
-		// Skip consecutive blank lines
-		if isBlank && prevBlank {
-			continue
-		}
-		result = append(result, line)
-		prevBlank = isBlank
-	}
-	return bytes.Join(result, []byte("\n"))
-}
-
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "gotrace: %v\n", err)
 	os.Exit(1)
@@ -435,139 +341,6 @@ func findModuleRoot(dir string) (string, error) {
 		}
 		current = parent
 	}
-}
-
-func syncModuleDeps(moduleRoot string) error {
-	modPath := filepath.Join(moduleRoot, "go.mod")
-	content, err := os.ReadFile(modPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	modulePath, err := readModulePath(modPath)
-	if err != nil {
-		return err
-	}
-	if modulePath == traceModule {
-		return nil
-	}
-	needsTrace, err := moduleUsesTrace(moduleRoot)
-	if err != nil {
-		return err
-	}
-	mod, err := modfile.Parse(modPath, content, nil)
-	if err != nil {
-		return err
-	}
-
-	changed := false
-	if needsTrace {
-		localRoot := findLocalGotraceRoot()
-		traceVersion := resolveTraceVersion()
-		if localRoot == "" {
-			if traceVersion == "v0.0.0" {
-				return fmt.Errorf("unable to locate local %s module; run gotrace from its repo or install the module", traceModule)
-			}
-		} else {
-			replacePath := localRoot
-			if rel, err := filepath.Rel(moduleRoot, localRoot); err == nil {
-				replacePath = rel
-			}
-			if !hasReplace(mod, traceModule, replacePath) {
-				if err := mod.AddReplace(traceModule, "", replacePath, ""); err != nil {
-					return err
-				}
-				changed = true
-			}
-		}
-		if !hasRequire(mod, traceModule) {
-			if err := mod.AddRequire(traceModule, traceVersion); err != nil {
-				return err
-			}
-			changed = true
-		}
-		if mod.Go == nil || mod.Go.Version == "" {
-			if err := mod.AddGoStmt("1.21"); err != nil {
-				return err
-			}
-			changed = true
-		}
-	} else {
-		if dropRequire(mod, traceModule) {
-			changed = true
-		}
-		if dropReplace(mod, traceModule) {
-			changed = true
-		}
-	}
-
-	if !changed {
-		return nil
-	}
-	formatted, err := mod.Format()
-	if err != nil {
-		return err
-	}
-	if *dryRun {
-		fmt.Printf("  Would update: %s\n", modPath)
-		return nil
-	}
-	return os.WriteFile(modPath, formatted, 0644)
-}
-
-func moduleUsesTrace(moduleRoot string) (bool, error) {
-	var found bool
-	errFound := errors.New("trace import found")
-	err := filepath.WalkDir(moduleRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			base := filepath.Base(path)
-			if base == "vendor" || base == "testdata" || strings.HasPrefix(base, ".") {
-				return filepath.SkipDir
-			}
-			if path != moduleRoot {
-				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
-					return filepath.SkipDir
-				} else if err != nil && !os.IsNotExist(err) {
-					return err
-				}
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if !bytes.Contains(content, []byte(tracePkg)) {
-			return nil
-		}
-		fset := token.NewFileSet()
-		node, err := parser.ParseFile(fset, path, content, parser.ImportsOnly)
-		if err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
-		}
-		for _, imp := range node.Imports {
-			if imp.Path.Value == fmt.Sprintf("%q", tracePkg) {
-				found = true
-				return errFound
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, errFound) {
-			return true, nil
-		}
-		return false, err
-	}
-	return found, nil
 }
 
 func findLocalGotraceRoot() string {
@@ -620,20 +393,6 @@ func hasReplace(mod *modfile.File, oldPath, newPath string) bool {
 		}
 	}
 	return false
-}
-
-func dropRequire(mod *modfile.File, path string) bool {
-	if err := mod.DropRequire(path); err != nil {
-		return false
-	}
-	return true
-}
-
-func dropReplace(mod *modfile.File, path string) bool {
-	if err := mod.DropReplace(path, ""); err != nil {
-		return false
-	}
-	return true
 }
 
 func resolveTraceVersion() string {

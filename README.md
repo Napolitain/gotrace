@@ -98,13 +98,15 @@ Flags:
   --verbose   Print detailed information
   --pattern   Only instrument functions matching pattern
   --filters   Comma-separated filters (e.g. 'panic')
+  --until     Only instrument call path to specified function
 
 Examples:
-  gotrace .                      # Run current directory with tracing
-  gotrace ./cmd/myapp            # Run specific package
-  gotrace ./cmd/myapp --port 80  # Run with arguments forwarded
-  gotrace --dry-run ./cmd/myapp  # Preview what would be instrumented
-  gotrace --filters panic .      # Only show traces when panic occurs
+  gotrace .                         # Run current directory with tracing
+  gotrace ./cmd/myapp               # Run specific package
+  gotrace ./cmd/myapp --port 80     # Run with arguments forwarded
+  gotrace --dry-run ./cmd/myapp     # Preview what would be instrumented
+  gotrace --filters panic .         # Only show traces when panic occurs
+  gotrace --until "DB.Query" .      # Only trace call path to DB.Query
 ```
 
 ## Filtering Modes
@@ -143,6 +145,30 @@ gotrace --filters panic ./cmd/myapp
 ```
 
 This is perfect for debugging — keep tracing enabled but silent until something goes wrong!
+
+### Call Path Mode
+
+With `--until`, gotrace uses static call graph analysis to only instrument functions that are in the call path to a specific target function:
+
+```bash
+# Only trace the path to handleRequest
+gotrace --until "handleRequest" ./cmd/server
+
+# Trace path to a method (use Type.Method format)
+gotrace --until "Database.Query" ./cmd/app
+```
+
+**Example output:**
+```
+→ main() [main.go:10 g1]
+  → Server.Start() [server.go:25 g1]
+    → handleRequest() [handler.go:42 g1]
+    ← handleRequest 1.23ms
+  ← Server.Start 5.67ms
+← main 5.70ms
+```
+
+Functions not in the call path (like utility functions, logging, etc.) are not traced, keeping output focused on what matters.
 
 ## Manual Usage
 

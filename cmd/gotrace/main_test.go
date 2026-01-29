@@ -12,6 +12,7 @@ import (
 )
 
 func TestInstrumentAST_AddsDeferTrace(t *testing.T) {
+	t.Parallel()
 	src := `package main
 
 func hello() {
@@ -48,6 +49,7 @@ func hello() {
 }
 
 func TestInstrumentAST_SkipsAlreadyInstrumented(t *testing.T) {
+	t.Parallel()
 	src := `package main
 
 import "github.com/napolitain/gotrace/trace"
@@ -70,6 +72,7 @@ func hello() {
 }
 
 func TestInstrumentAST_InstrumentsWithArgs(t *testing.T) {
+	t.Parallel()
 	src := `package main
 
 func add(a, b int) int {
@@ -106,6 +109,7 @@ func add(a, b int) int {
 }
 
 func TestInstrumentAST_AddsPrintSummaryToMain(t *testing.T) {
+	t.Parallel()
 	src := `package main
 
 func main() {
@@ -142,6 +146,7 @@ func main() {
 }
 
 func TestInstrumentFile_ReturnsOriginalIfNoFunctions(t *testing.T) {
+	t.Parallel()
 	src := `package main
 
 var x = 42
@@ -157,6 +162,7 @@ var x = 42
 }
 
 func TestInstrumentFile_HandlesMethodReceivers(t *testing.T) {
+	t.Parallel()
 	src := `package main
 
 type Calculator struct{}
@@ -176,6 +182,7 @@ func (c *Calculator) Add(a, b int) int {
 }
 
 func TestFuncName_ReturnsCorrectNames(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		src      string
 		expected string
@@ -208,6 +215,7 @@ func TestFuncName_ReturnsCorrectNames(t *testing.T) {
 }
 
 func TestCopyAndInstrumentModule_SkipsVendorAndTestdata(t *testing.T) {
+	t.Parallel()
 	tempSrc := t.TempDir()
 	tempDst := t.TempDir()
 
@@ -269,5 +277,65 @@ func TestPreviewInstrumentation_ListsFilesToInstrument(t *testing.T) {
 
 	if !strings.Contains(output, "main.go") {
 		t.Errorf("expected output to mention main.go, got:\n%s", output)
+	}
+}
+
+func TestInstrumentAST_WithAllowedFuncs(t *testing.T) {
+	t.Parallel()
+	src := `package main
+
+func main() {
+	helper()
+	other()
+}
+
+func helper() {
+	println("helper")
+}
+
+func other() {
+	println("other")
+}
+`
+	// Save and restore global state
+	oldAllowed := allowedFuncs
+	defer func() { allowedFuncs = oldAllowed }()
+
+	// Only allow "main" and "helper" to be instrumented
+	allowedFuncs = map[string]bool{
+		"main":   true,
+		"helper": true,
+	}
+
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "test.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	modified := instrumentAST(node)
+	if !modified {
+		t.Fatal("expected AST to be modified")
+	}
+
+	// Check which functions were instrumented
+	instrumented := make(map[string]bool)
+	ast.Inspect(node, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Body != nil {
+			if len(fn.Body.List) > 0 && isTraceDefer(fn.Body.List[0]) {
+				instrumented[fn.Name.Name] = true
+			}
+		}
+		return true
+	})
+
+	if !instrumented["main"] {
+		t.Error("expected main to be instrumented")
+	}
+	if !instrumented["helper"] {
+		t.Error("expected helper to be instrumented")
+	}
+	if instrumented["other"] {
+		t.Error("expected other to NOT be instrumented (not in allowedFuncs)")
 	}
 }

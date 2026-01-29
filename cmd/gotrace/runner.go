@@ -43,6 +43,25 @@ func RunHot(target string, args []string) error {
 		return fmt.Errorf("no go.mod found for %s", absTarget)
 	}
 
+	// If --until is specified, build call graph and find functions to instrument
+	if *until != "" {
+		if *verbose {
+			fmt.Printf("Building call graph to find path to %q...\n", *until)
+		}
+		graph, prog, err := buildCallGraph(moduleRoot)
+		if err != nil {
+			return fmt.Errorf("build call graph: %w", err)
+		}
+		callers, err := findCallersTo(graph, prog, *until)
+		if err != nil {
+			return fmt.Errorf("find callers: %w", err)
+		}
+		if *verbose {
+			fmt.Printf("Will instrument functions in call path to %q\n", *until)
+		}
+		allowedFuncs = callers
+	}
+
 	// Create temp directory for instrumented code
 	tempDir, err := os.MkdirTemp("", "gotrace-*")
 	if err != nil {
@@ -259,21 +278,31 @@ func runBinary(binaryPath string, args []string) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	if err := cmd.Start(); err != nil {
+		signal.Stop(sigCh)
 		return fmt.Errorf("start: %w", err)
 	}
 
-	// Forward signals to child
+	// Forward signals to child in a goroutine
+	done := make(chan struct{})
 	go func() {
-		for sig := range sigCh {
-			if cmd.Process != nil {
-				cmd.Process.Signal(sig)
+		for {
+			select {
+			case sig, ok := <-sigCh:
+				if !ok {
+					return
+				}
+				if cmd.Process != nil {
+					cmd.Process.Signal(sig)
+				}
+			case <-done:
+				return
 			}
 		}
 	}()
 
 	err := cmd.Wait()
 	signal.Stop(sigCh)
-	close(sigCh)
+	close(done)
 
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
