@@ -1,3 +1,18 @@
 [submodule "test/projects/golang-example"]
 	path = test/projects/golang-example
 	url = https://github.com/golang/example.git
+[submodule "test/projects/prometheus"]
+	path = test/projects/prometheus
+	url = https://github.com/prometheus/prometheus
+[submodule "test/projects/consul"]
+	path = test/projects/consul
+	url = https://github.com/hashicorp/consul
+[submodule "test/projects/docker-cli"]
+	path = test/projects/docker-cli
+	url = https://github.com/docker/cli
+[submodule "test/projects/hugo"]
+	path = test/projects/hugo
+	url = https://github.com/gohugoio/hugo
+[submodule "test/projects/kubernetes"]
+	path = test/projects/kubernetes
+	url = https://github.com/kubernetes/kubernetes

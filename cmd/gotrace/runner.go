@@ -3,9 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"go/format"
-	"go/parser"
-	"go/token"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -111,7 +108,11 @@ func RunHot(target string, args []string) error {
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tempDir)
+	if !*verbose {
+		defer os.RemoveAll(tempDir)
+	} else {
+		fmt.Printf("Temp directory (not cleaned up in verbose mode): %s\n", tempDir)
+	}
 
 	// Copy and instrument the entire module
 	if err := copyAndInstrumentModule(moduleRoot, tempDir); err != nil {
@@ -122,6 +123,11 @@ func RunHot(target string, args []string) error {
 	relTarget, err := filepath.Rel(moduleRoot, absTarget)
 	if err != nil {
 		return fmt.Errorf("relative path: %w", err)
+	}
+
+	// Run go mod tidy to sync dependencies after adding gotrace import
+	if err := runGoModTidy(tempDir); err != nil {
+		return fmt.Errorf("go mod tidy: %w", err)
 	}
 
 	// Build the instrumented code
@@ -166,6 +172,10 @@ func copyAndInstrumentModule(moduleRoot, tempDir string) error {
 				return filepath.SkipDir
 			}
 			if strings.HasPrefix(base, ".") && base != "." && base != ".." {
+				return filepath.SkipDir
+			}
+			// Skip test/projects - these are submodules for testing, not part of the target
+			if rel == filepath.Join("test", "projects") {
 				return filepath.SkipDir
 			}
 			// Skip cmd/gotrace dir when instrumenting gotrace itself (avoid instrumenting the tool)
@@ -222,37 +232,14 @@ func copyAndInstrumentModule(moduleRoot, tempDir string) error {
 			return os.WriteFile(destPath, content, 0644)
 		}
 
-		// Instrument the Go file
-		instrumented, err := instrumentFile(path, content)
+		// Instrument the Go file using source-level injection (preserves all comments/directives)
+		instrumented, err := instrumentFileText(path, content)
 		if err != nil {
 			return fmt.Errorf("instrument %s: %w", path, err)
 		}
 
 		return os.WriteFile(destPath, instrumented, 0644)
 	})
-}
-
-// instrumentFile instruments a single Go file in memory
-func instrumentFile(filename string, content []byte) ([]byte, error) {
-	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, filename, content, parser.ParseComments)
-	if err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
-	}
-
-	// Use existing instrumentation logic
-	modified := instrumentAST(node)
-	if !modified {
-		return content, nil
-	}
-
-	// Format the instrumented code
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, node); err != nil {
-		return nil, fmt.Errorf("format: %w", err)
-	}
-
-	return buf.Bytes(), nil
 }
 
 // instrumentGoMod adds the gotrace dependency to go.mod
@@ -294,6 +281,20 @@ func instrumentGoMod(content []byte, moduleRoot string) ([]byte, error) {
 	}
 
 	return mod.Format()
+}
+
+// runGoModTidy runs go mod tidy in the given directory
+func runGoModTidy(dir string) error {
+	cmd := exec.Command("go", "mod", "tidy")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if *verbose {
+		fmt.Printf("Running go mod tidy in %s...\n", dir)
+	}
+
+	return cmd.Run()
 }
 
 // buildInstrumented compiles the instrumented code

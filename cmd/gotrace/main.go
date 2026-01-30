@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	traceModule = "github.com/napolitain/gotrace"
-	tracePkg    = traceModule + "/trace"
+	traceModule   = "github.com/napolitain/gotrace"
+	tracePkg      = traceModule + "/trace"
+	tracePkgAlias = "gotrace_trace" // Alias to avoid conflicts with runtime/trace or user packages
 )
 
 var (
@@ -189,6 +190,10 @@ func instrumentAST(node *ast.File) bool {
 		if fn.Type.Params != nil {
 			for _, field := range fn.Type.Params.List {
 				for _, paramName := range field.Names {
+					// Skip blank identifiers - they can't be used as values
+					if paramName.Name == "_" {
+						continue
+					}
 					args = append(args, ast.NewIdent(paramName.Name))
 				}
 			}
@@ -204,7 +209,7 @@ func instrumentAST(node *ast.File) bool {
 			Call: &ast.CallExpr{
 				Fun: &ast.CallExpr{
 					Fun: &ast.SelectorExpr{
-						X:   ast.NewIdent("trace"),
+						X:   ast.NewIdent(tracePkgAlias),
 						Sel: ast.NewIdent(traceFuncName),
 					},
 					Args: args,
@@ -218,7 +223,7 @@ func instrumentAST(node *ast.File) bool {
 	})
 
 	if modified {
-		addImport(node, tracePkg)
+		addImportWithAlias(node, tracePkg, tracePkgAlias)
 	}
 
 	// Add PrintSummary or PrintFunctionStats to main if present
@@ -232,7 +237,7 @@ func instrumentAST(node *ast.File) bool {
 			// --function mode: use PrintFunctionStats
 			summaryCall = &ast.ExprStmt{
 				X: &ast.CallExpr{
-					Fun:  &ast.SelectorExpr{X: ast.NewIdent("trace"), Sel: ast.NewIdent("PrintFunctionStats")},
+					Fun:  &ast.SelectorExpr{X: ast.NewIdent(tracePkgAlias), Sel: ast.NewIdent("PrintFunctionStats")},
 					Args: []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: fmt.Sprintf("%q", targetFunction)}},
 				},
 			}
@@ -240,7 +245,7 @@ func instrumentAST(node *ast.File) bool {
 			// Normal mode: use PrintSummary
 			summaryCall = &ast.ExprStmt{
 				X: &ast.CallExpr{
-					Fun: &ast.SelectorExpr{X: ast.NewIdent("trace"), Sel: ast.NewIdent("PrintSummary")},
+					Fun: &ast.SelectorExpr{X: ast.NewIdent(tracePkgAlias), Sel: ast.NewIdent("PrintSummary")},
 				},
 			}
 		}
@@ -293,7 +298,11 @@ func isTraceDefer(stmt ast.Stmt) bool {
 		return false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	if !ok || id.Name != "trace" {
+	if !ok {
+		return false
+	}
+	// Match both old "trace" and new alias
+	if id.Name != "trace" && id.Name != tracePkgAlias {
 		return false
 	}
 	// Match both Trace and TraceOnPanic
@@ -314,7 +323,36 @@ func isTraceSummary(stmt ast.Stmt) bool {
 		return false
 	}
 	id, ok := sel.X.(*ast.Ident)
-	return ok && id.Name == "trace" && sel.Sel.Name == "PrintSummary"
+	if !ok {
+		return false
+	}
+	// Match both old "trace" and new alias
+	return (id.Name == "trace" || id.Name == tracePkgAlias) && (sel.Sel.Name == "PrintSummary" || sel.Sel.Name == "PrintFunctionStats")
+}
+
+func addImportWithAlias(node *ast.File, path, alias string) {
+	for _, imp := range node.Imports {
+		if imp.Path.Value == fmt.Sprintf("%q", path) {
+			return
+		}
+	}
+
+	newImport := &ast.ImportSpec{
+		Name: ast.NewIdent(alias),
+		Path: &ast.BasicLit{Kind: token.STRING, Value: fmt.Sprintf("%q", path)},
+	}
+
+	for _, decl := range node.Decls {
+		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
+			gen.Specs = append(gen.Specs, newImport)
+			return
+		}
+	}
+
+	node.Decls = append([]ast.Decl{&ast.GenDecl{
+		Tok:   token.IMPORT,
+		Specs: []ast.Spec{newImport},
+	}}, node.Decls...)
 }
 
 func addImport(node *ast.File, path string) {

@@ -151,9 +151,9 @@ func TestInstrumentFile_ReturnsOriginalIfNoFunctions(t *testing.T) {
 
 var x = 42
 `
-	result, err := instrumentFile("test.go", []byte(src))
+	result, err := instrumentFileText("test.go", []byte(src))
 	if err != nil {
-		t.Fatalf("instrumentFile: %v", err)
+		t.Fatalf("instrumentFileText: %v", err)
 	}
 
 	if !bytes.Equal(result, []byte(src)) {
@@ -171,12 +171,12 @@ func (c *Calculator) Add(a, b int) int {
 	return a + b
 }
 `
-	result, err := instrumentFile("test.go", []byte(src))
+	result, err := instrumentFileText("test.go", []byte(src))
 	if err != nil {
-		t.Fatalf("instrumentFile: %v", err)
+		t.Fatalf("instrumentFileText: %v", err)
 	}
 
-	if !strings.Contains(string(result), `trace.Trace("Calculator.Add"`) {
+	if !strings.Contains(string(result), `gotrace_trace.Trace("Calculator.Add"`) {
 		t.Fatalf("expected method receiver to be included in trace name, got:\n%s", result)
 	}
 }
