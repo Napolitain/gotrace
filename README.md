@@ -2,9 +2,6 @@
 
 A lean function tracer for Go with hot instrumentation and pretty terminal output.
 
-![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
-
 ## Features
 
 - 🔥 **Hot instrumentation** — Instruments code in-memory, no files modified on disk
