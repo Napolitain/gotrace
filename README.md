@@ -23,6 +23,7 @@ go install github.com/napolitain/gotrace/cmd/gotrace@latest
 
 ```bash
 gotrace ./cmd/myapp              # Trace your program
+gotrace --summary .             # Only print the final summary
 gotrace --function "fibonacci" . # Micro-benchmark a specific function
 gotrace --until "DB.Query" .     # Trace only the path to a function
 gotrace --pmu .                  # Include hardware counters (Linux)
@@ -60,6 +61,7 @@ Flags:
   --verbose    Print detailed information
   --pattern    Only instrument functions matching pattern
   --filters    Comma-separated filters (e.g. 'panic')
+  --summary    Only print final summary/statistics
   --until      Trace call path TO this function
   --from       Trace FROM this function (callees)
   --function   Micro-benchmark a single function
@@ -68,6 +70,7 @@ Flags:
 Examples:
   gotrace .                           # Trace current directory
   gotrace ./cmd/myapp --port 80       # Forward args to program
+  gotrace --summary .                 # Only print final summary/statistics
   gotrace --filters panic .           # Only show traces on panic
   gotrace --until "DB.Query" .        # Trace path to DB.Query
   gotrace --from "Server.Start" .     # Trace from Server.Start

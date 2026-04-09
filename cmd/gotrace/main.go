@@ -26,6 +26,7 @@ var (
 	verbose      = flag.Bool("verbose", false, "print detailed info")
 	pattern      = flag.String("pattern", "", "only instrument functions matching pattern")
 	filters      = flag.String("filters", "", "comma-separated filters (e.g. 'panic')")
+	summary      = flag.Bool("summary", false, "only print final summary/statistics, suppress live trace output")
 	until        = flag.String("until", "", "only instrument call path to this function")
 	from         = flag.String("from", "", "trace from this function (use with --until for segments)")
 	pmu          = flag.Bool("pmu", false, "collect hardware performance counters (Linux only)")
@@ -53,6 +54,7 @@ Examples:
   gotrace .                       # Run current directory with tracing
   gotrace ./cmd/app               # Run specific package
   gotrace ./cmd/app --port 80     # Run with arguments forwarded
+  gotrace --summary .             # Only print the final summary
   gotrace --dry-run ./cmd/app     # Preview instrumentation without running
   gotrace --filters panic .       # Only show traces when panic occurs
   gotrace --until "DB.Query" .    # Only trace call path to DB.Query

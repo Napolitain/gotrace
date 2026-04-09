@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	tracepkg "github.com/napolitain/gotrace/trace"
 	"golang.org/x/mod/modfile"
 )
 
@@ -317,6 +318,7 @@ func runBinary(binaryPath string, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = binaryEnv()
 
 	// Setup PMU counters (will be inherited by child with enable_on_exec)
 	if err := InitPMUForChild(); err != nil {
@@ -371,4 +373,11 @@ func runBinary(binaryPath string, args []string) error {
 	PrintPMUSummary(pmuCounters)
 
 	return nil
+}
+
+func binaryEnv() []string {
+	if !*summary {
+		return nil
+	}
+	return append(os.Environ(), tracepkg.SummaryOnlyEnvVar+"=1")
 }

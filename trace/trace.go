@@ -18,6 +18,8 @@ import (
 //go:linkname nanotime runtime.nanotime
 func nanotime() int64
 
+const SummaryOnlyEnvVar = "GOTRACE_SUMMARY_ONLY"
+
 // Styles using lipgloss
 var (
 	funcStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#4ECDC4"))
@@ -44,6 +46,7 @@ var (
 	mu           sync.Mutex
 	traces       []Entry
 	colorize     atomic.Bool
+	summaryOnly  atomic.Bool
 	panicStacks  map[uint64][]string // Per-goroutine call stacks
 	panicMu      sync.Mutex
 	panicPrinted atomic.Bool
@@ -53,6 +56,7 @@ func init() {
 	warnThresholdNs.Store(1_000_000) // 1ms
 	hotThresholdNs.Store(10_000_000) // 10ms
 	colorize.Store(os.Getenv("NO_COLOR") == "")
+	summaryOnly.Store(os.Getenv(SummaryOnlyEnvVar) != "")
 	panicStacks = make(map[uint64][]string)
 }
 
@@ -85,7 +89,9 @@ func Trace(name string, args ...any) func(...any) {
 	}
 
 	indent := strings.Repeat("  ", int(d-1))
-	printEntry(indent, name, args, file, line, gid)
+	if !summaryOnly.Load() {
+		printEntry(indent, name, args, file, line, gid)
+	}
 
 	return func(returns ...any) {
 		end := nanotime()
@@ -99,7 +105,9 @@ func Trace(name string, args ...any) func(...any) {
 			printPanic(indent, name, dur, r)
 			defer panic(r)
 		} else {
-			printExit(indent, name, dur, returns)
+			if !summaryOnly.Load() {
+				printExit(indent, name, dur, returns)
+			}
 		}
 
 		mu.Lock()
@@ -241,6 +249,12 @@ func SetThresholds(warnNs, hotNs int64) {
 // Color is enabled by default unless NO_COLOR environment variable is set.
 func SetColorize(enabled bool) {
 	colorize.Store(enabled)
+}
+
+// SetSummaryOnly enables/disables live trace output while continuing to collect
+// trace data for summary/statistics reporting.
+func SetSummaryOnly(enabled bool) {
+	summaryOnly.Store(enabled)
 }
 
 // PrintSummary displays a formatted summary of all traces including
